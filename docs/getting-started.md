@@ -15,7 +15,7 @@ This guide will help you get started with using stack graphs in your projects. W
 
 Before you begin, make sure you have:
 
-- **Rust** installed (version 1.65 or later recommended)
+- **Rust** installed (version 1.70 or later recommended)
   - Install via [rustup](https://rustup.rs/): `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Basic understanding of Rust** (for using the library)
 - **Familiarity with your target language** (if implementing stack graph rules)
