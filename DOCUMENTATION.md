@@ -223,8 +223,25 @@ docs/
 ```
 stack-graphs/src/
 ├── lib.rs (improved module docs + examples)
-└── graph.rs (comprehensive inline comments + docstrings)
+├── graph.rs (comprehensive inline comments + docstrings)
+├── paths.rs (enhanced module and type documentation)
+├── arena.rs (detailed arena and handle documentation)
+├── partial.rs (comprehensive partial paths documentation)
+├── stitching.rs (detailed path stitching documentation)
+├── cycles.rs (cycle detection algorithm documentation)
+├── utils.rs (utility functions documentation)
+├── stats.rs (frequency distribution documentation)
+├── debugging.rs (conditional debugging macro documentation)
+├── assert.rs (assertion testing framework documentation)
+├── c.rs (comprehensive C FFI documentation)
+├── storage.rs (SQLite backend documentation)
+├── visualization.rs (HTML visualization documentation)
+└── serde/
+    └── mod.rs (serialization module documentation)
 ```
+
+**Total**: 15 core modules fully documented with comprehensive module-level docs,
+type documentation, method documentation, examples, and inline comments.
 
 ## Documentation Standards Applied
 
