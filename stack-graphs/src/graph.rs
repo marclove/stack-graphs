@@ -1692,8 +1692,9 @@ impl std::ops::AddAssign for Degree {
 /// let greeting_sym = graph.add_symbol("greeting");
 ///
 /// // Create nodes
-/// let scope = graph.add_scope_node(
-///     NodeID::new_in_file(file, 0),
+/// let scope = graph.add_scope_node_for_file(
+///     file,
+///     0,
 ///     false
 /// ).unwrap();
 ///
