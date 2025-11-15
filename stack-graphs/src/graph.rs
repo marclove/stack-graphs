@@ -228,7 +228,7 @@ impl InternedStringContent {
     /// This is safe as long as the `InternedStringContent` doesn't outlive the
     /// `InternedStringArena` that created it. We guarantee this by:
     ///
-    /// 1. Storing `InternedStringContent` in an `Arena` alongside the `InternedStringArena`
+    /// 1. Storing `InternedStringContent` in the `InternedStringArena`
     /// 2. Only handing out references (never owned values)
     /// 3. Both arenas having the same lifetime (tied to the `StackGraph`)
     ///
