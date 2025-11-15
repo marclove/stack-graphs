@@ -185,7 +185,7 @@ fn main() {
 
     // Create some nodes
     let root = graph.root_node();
-    let module_scope = graph.add_scope_node(file, false).expect("Failed to create scope");
+    let module_scope = graph.add_scope_node(NodeID::new_in_file(file, 0), false).expect("Failed to create scope");
 
     // Add a symbol
     let greeting = graph.add_symbol("greeting");
