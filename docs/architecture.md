@@ -196,9 +196,13 @@ pub struct StackGraph {
 
     // String interning
     interned_strings: InternedStringArena,
+}
 
-    // Root node (singleton)
-    root: Handle<Node>,
+impl StackGraph {
+    /// Returns the handle to the singleton root node.
+    pub fn root_node(&self) -> Handle<Node> {
+        // implementation omitted
+    }
 }
 ```
 
