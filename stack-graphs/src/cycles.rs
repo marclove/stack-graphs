@@ -5,29 +5,132 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
-//! Detect and avoid cycles in our path-finding algorithm.
+//! Cycle detection prevents infinite loops during path finding.
 //!
-//! Cycles in a stack graph can indicate many things.  Your language might allow mutually recursive
-//! imports.  If you are modeling dataflow through function calls, then any recursion in your
-//! function calls will lead to cycles in your stack graph.  And if you have any control-flow paths
-//! that lead to infinite loops at runtime, we'll probably discover those as stack graph paths
-//! during the path-finding algorithm.
+//! During path finding, we may encounter cycles in the stack graph. These cycles can arise from
+//! legitimate language features and must be detected and handled appropriately.
 //!
-//! (Note that we're only considering cycles in well-formed paths.  For instance, _pop symbol_
-//! nodes are "guards" that don't allow you to progress into a node if the top of the symbol stack
-//! doesn't match.  We don't consider that a valid path, and so we don't have to worry about
-//! whether it contains any cycles.)
+//! ## Why Cycles Occur
 //!
-//! This module implements a cycle detector that lets us detect these situations and "cut off"
-//! these paths, not trying to extend them any further.  Note that any cycle detection logic we
-//! implement will be a heuristic.  In particular, since our path-finding algorithm will mimic any
-//! runtime recursion, a "complete" cycle detection logic would be equivalent to the Halting
-//! Problem.
+//! Cycles in stack graphs can indicate several scenarios:
 //!
-//! Right now, we implement a simple heuristic where we limit the number of distinct paths that we
-//! process that have the same start and end nodes.  We do not make any guarantees that we will
-//! always use this particular heuristic, however!  We reserve the right to change the heuristic at
-//! any time.
+//! ### 1. Mutually Recursive Imports
+//!
+//! ```python
+//! # File A
+//! from B import foo
+//!
+//! # File B
+//! from A import bar
+//! ```
+//!
+//! This creates a cycle in the import graph.
+//!
+//! ### 2. Recursive Functions
+//!
+//! If modeling dataflow through function calls:
+//!
+//! ```python
+//! def factorial(n):
+//!     if n <= 1:
+//!         return 1
+//!     return n * factorial(n - 1)  # Recursive call creates a cycle
+//! ```
+//!
+//! ### 3. Infinite Loops
+//!
+//! Any control-flow that creates infinite loops at runtime may appear as cycles during path finding:
+//!
+//! ```python
+//! while True:
+//!     x = process(x)  # Cycle in control flow
+//! ```
+//!
+//! ## Well-Formed Path Cycles
+//!
+//! **Important**: We only consider cycles in **well-formed** paths. Pop symbol nodes act as
+//! "guards" that prevent progression if the symbol stack doesn't match. Invalid paths are
+//! rejected before cycle detection, so we don't need to handle cycles in invalid paths.
+//!
+//! ```text
+//! Valid path (can cycle):
+//!   [ref to foo] → [import] → [root] → [export] → [def of foo]
+//!   symbol_stack: [] → ["foo"] → ["foo"] → []
+//!   ✓ All stack operations match
+//!
+//! Invalid path (rejected before cycles matter):
+//!   [ref to foo] → [def of bar]
+//!   Pop expects "bar" but stack has "foo"
+//!   ✗ Rejected immediately
+//! ```
+//!
+//! ## The Halting Problem
+//!
+//! Complete cycle detection is fundamentally impossible! Since path-finding mimics runtime
+//! execution (including recursion), determining whether all paths will eventually terminate
+//! is equivalent to solving the [Halting Problem](https://en.wikipedia.org/wiki/Halting_problem).
+//!
+//! Therefore, **any cycle detection is necessarily a heuristic**.
+//!
+//! ## Our Heuristic: Similar Path Detection
+//!
+//! We use a practical heuristic that limits "similar" paths:
+//!
+//! ### Similar Path Definition
+//!
+//! Two paths are considered similar if they have:
+//! - Same **start node** and **end node**
+//! - Same **symbol stack precondition** length
+//! - Same **symbol stack postcondition** length
+//! - Same **scope stack precondition** length
+//! - Same **scope stack postcondition** length
+//!
+//! ### The Heuristic
+//!
+//! We limit the number of distinct paths with the same similarity key. When we encounter too
+//! many similar paths, we stop exploring that branch.
+//!
+//! ### Example
+//!
+//! ```text
+//! Processing paths for recursive function:
+//!
+//! Path 1: [call] → [def] → [return]
+//!   (First iteration)
+//!
+//! Path 2: [call] → [def] → [call] → [def] → [return]
+//!   (Recursive call, depth 1)
+//!   Similar to Path 1 (same start/end, same stack states)
+//!
+//! Path 3: [call] → [def] → [call] → [def] → [call] → [def] → [return]
+//!   (Recursive call, depth 2)
+//!   Similar to Path 1 and Path 2
+//!
+//! After hitting the limit, stop exploring deeper recursions.
+//! ```
+//!
+//! ## Path Comparison
+//!
+//! When multiple similar paths exist, we keep the "better" ones and discard inferior paths.
+//! What makes a path "better" depends on the context (e.g., shorter paths, specific precedence
+//! rules).
+//!
+//! ## No Guarantees
+//!
+//! **Important**: The exact heuristic used is an implementation detail and may change in future
+//! versions. We reserve the right to adjust the cycle detection strategy at any time.
+//!
+//! ## Performance Impact
+//!
+//! Cycle detection is crucial for performance:
+//! - **Without it**: Path finding could run infinitely
+//! - **With it**: Bounded execution time, even on graphs with cycles
+//! - **Trade-off**: May miss some valid paths in deeply recursive scenarios
+//!
+//! ## See Also
+//!
+//! - [`SimilarPathDetector`] - The main cycle detection implementation
+//! - [`AppendingCycleDetector`] - Detects cycles during path extension
 
 use enumset::EnumSet;
 use smallvec::SmallVec;
@@ -48,9 +151,52 @@ use crate::stats::FrequencyDistribution;
 use crate::stitching::Appendable;
 use crate::stitching::ToAppendable;
 
-/// Helps detect similar paths in the path-finding algorithm.
+/// Detects and limits similar paths to prevent infinite cycles.
+///
+/// This structure implements the similar path heuristic described in the module documentation.
+/// It groups paths by a "similarity key" (start/end nodes and stack state lengths) and limits
+/// how many similar paths we process.
+///
+/// ## How It Works
+///
+/// 1. **Grouping**: Paths with the same [`PathKey`] are grouped into buckets
+/// 2. **Comparison**: When adding a new path, compare it against existing paths in its bucket
+/// 3. **Selection**: Keep only the "better" paths (shorter, higher precedence, etc.)
+/// 4. **Limiting**: Implicitly limits similar paths by pruning inferior ones
+///
+/// ## Data Structure
+///
+/// ```text
+/// PathKey { start: A, end: B, ... }
+///   ↓
+/// Bucket: [path1, path2, path3, ...]
+///         (All paths with this key)
+///
+/// When adding new_path:
+///   - Compare against each path in bucket
+///   - If new_path is better: remove old path
+///   - If new_path is worse: ignore it
+///   - If incomparable: keep both
+/// ```
+///
+/// ## Statistics
+///
+/// When enabled, tracks:
+/// - **Bucket sizes**: How many paths share each similarity key
+/// - **Similar path counts**: How many similar paths were rejected
+///
+/// This helps tune the heuristic and understand cycle behavior.
+///
+/// ## Generic Parameter
+///
+/// - `P`: The path type (must implement [`HasPathKey`])
 pub struct SimilarPathDetector<P> {
+    /// Maps path similarity keys to buckets of similar paths.
+    /// SmallVec optimizes for the common case of few similar paths per key.
     paths: HashMap<PathKey, SmallVec<[P; 4]>>,
+
+    /// Optional statistics tracking for similar path counts.
+    /// Only allocated when statistics collection is enabled.
     counts: Option<HashMap<PathKey, SmallVec<[usize; 4]>>>,
 }
 
