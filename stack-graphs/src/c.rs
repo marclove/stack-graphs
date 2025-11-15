@@ -5,7 +5,209 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
-//! Defines a C API for working with stack graphs in other languages.
+//! C foreign function interface (FFI) for stack graphs.
+//!
+//! This module provides a C-compatible API for working with stack graphs, allowing the
+//! library to be used from languages other than Rust that can interface with C code.
+//!
+//! ## Overview
+//!
+//! The C API provides access to all core stack graphs functionality:
+//! - Creating and manipulating stack graphs
+//! - Building partial paths
+//! - Path stitching and name resolution
+//! - Serialization and deserialization
+//!
+//! ## Memory Management
+//!
+//! ### Ownership Model
+//!
+//! The C API follows a clear ownership model:
+//!
+//! - **Creation functions** (e.g., `sg_stack_graph_new`) allocate objects and return
+//!   raw pointers. The caller owns these pointers.
+//!
+//! - **Free functions** (e.g., `sg_stack_graph_free`) deallocate objects. After calling
+//!   a free function, the pointer becomes invalid and must not be used.
+//!
+//! - **Borrow semantics**: Most API functions borrow their arguments (don't take ownership),
+//!   so the pointers remain valid after the call.
+//!
+//! ### Example Memory Management
+//!
+//! ```c
+//! // Create a stack graph (you own this pointer)
+//! sg_stack_graph* graph = sg_stack_graph_new();
+//!
+//! // Use it...
+//! sg_node_id_t file_node = sg_stack_graph_get_or_create_file(graph, "example.py");
+//!
+//! // Free it when done (pointer becomes invalid)
+//! sg_stack_graph_free(graph);
+//! // Don't use 'graph' after this point!
+//! ```
+//!
+//! ## Type System
+//!
+//! ### Handle Types
+//!
+//! The API uses `u32` handles instead of pointers for graph elements:
+//! - `sg_file_handle` - References a file in the graph
+//! - `sg_node_id_handle` - References a node ID
+//! - `sg_symbol_handle` - References an interned symbol
+//! - `sg_node_handle` - References a node
+//!
+//! Handles are lightweight (4 bytes) and can be copied freely. The special value
+//! `SG_NULL_HANDLE` (0) represents a null/invalid handle.
+//!
+//! ### Opaque Pointers
+//!
+//! Main data structures are exposed as opaque pointers:
+//! - `sg_stack_graph*` - The stack graph itself
+//! - `sg_partial_path_arena*` - Container for partial paths
+//! - `sg_partial_path_database*` - Database of precomputed paths
+//!
+//! ## Building Stack Graphs from C
+//!
+//! ```c
+//! // Create a stack graph
+//! sg_stack_graph* graph = sg_stack_graph_new();
+//!
+//! // Add a file
+//! const char* filename = "example.py";
+//! sg_file_handle file = sg_stack_graph_add_file(graph, filename);
+//!
+//! // Create a node ID for a scope node
+//! sg_node_id_handle scope_id = sg_node_id_new_in_file(file, 0);
+//!
+//! // Add the scope node
+//! sg_node_handle scope = sg_stack_graph_add_scope_node(
+//!     graph,
+//!     scope_id,
+//!     0  // not exported
+//! );
+//!
+//! // Add a symbol
+//! sg_symbol_handle symbol = sg_stack_graph_add_symbol(graph, "my_var");
+//!
+//! // Add a definition node
+//! sg_node_id_handle def_id = sg_node_id_new_in_file(file, 1);
+//! sg_node_handle def = sg_stack_graph_add_pop_symbol_node(
+//!     graph,
+//!     def_id,
+//!     symbol,
+//!     1  // is_definition
+//! );
+//!
+//! // Connect them with an edge
+//! sg_stack_graph_add_edge(graph, def, scope, 0);
+//!
+//! // Clean up
+//! sg_stack_graph_free(graph);
+//! ```
+//!
+//! ## Path Finding from C
+//!
+//! ```c
+//! sg_stack_graph* graph = /* ... */;
+//! sg_partial_path_arena* partials = sg_partial_path_arena_new();
+//! sg_partial_path_database* db = sg_partial_path_database_new();
+//!
+//! // Find all partial paths in a file
+//! sg_file_handle file = /* ... */;
+//! sg_partial_path_arena_find_all_paths_from_file(
+//!     partials,
+//!     graph,
+//!     file,
+//!     NULL  // no cancellation
+//! );
+//!
+//! // Store them in the database
+//! sg_partial_path_database_add_partial_paths(db, partials, graph);
+//!
+//! // Stitch paths to find complete name bindings
+//! sg_node_handle reference = /* ... */;
+//! sg_forward_path_stitcher_config config = sg_forward_path_stitcher_config_new();
+//! sg_forward_partial_path_stitcher_from_node(
+//!     graph,
+//!     partials,
+//!     db,
+//!     reference,
+//!     config,
+//!     NULL,  // no cancellation
+//!     my_callback_function,
+//!     callback_user_data
+//! );
+//!
+//! // Clean up
+//! sg_partial_path_database_free(db);
+//! sg_partial_path_arena_free(partials);
+//! ```
+//!
+//! ## Error Handling
+//!
+//! The C API uses several error handling approaches:
+//!
+//! ### Return Values
+//!
+//! - Functions that can fail return `0` on success, non-zero on error
+//! - Functions returning handles return `SG_NULL_HANDLE` on failure
+//! - Functions returning pointers return `NULL` on failure
+//!
+//! ### Panics
+//!
+//! Some functions may panic (abort the program) on:
+//! - Invalid handles
+//! - Null pointers where valid pointers are required
+//! - Internal consistency violations
+//!
+//! Always ensure you pass valid arguments to avoid panics.
+//!
+//! ## Thread Safety
+//!
+//! - **Stack graphs are NOT thread-safe**. Don't access the same graph from multiple threads.
+//! - Create separate graphs per thread if parallel processing is needed.
+//! - Path stitching can be parallelized by running separate stitcher instances per thread.
+//!
+//! ## Naming Conventions
+//!
+//! The C API follows these conventions:
+//! - All public symbols are prefixed with `sg_` (stack graphs)
+//! - Type names use lowercase with underscores: `sg_stack_graph`
+//! - Function names use the pattern: `sg_<type>_<action>`: `sg_stack_graph_add_node`
+//! - Constants use uppercase: `SG_NULL_HANDLE`
+//!
+//! ## Cargo Features
+//!
+//! This module requires no special cargo features - it's available by default when building
+//! the stack-graphs crate as a C library.
+//!
+//! ## Building the C Library
+//!
+//! To build the C library:
+//!
+//! ```bash
+//! cargo build --release --lib
+//! ```
+//!
+//! This produces a shared library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows)
+//! that can be linked from C code.
+//!
+//! ## Language Bindings
+//!
+//! This C API can be used as a foundation for bindings to other languages:
+//! - **Python**: Via `ctypes` or `cffi`
+//! - **Ruby**: Via `fiddle` or `ffi`
+//! - **JavaScript**: Via `node-ffi`  or N-API
+//! - **Go**: Via `cgo`
+//! - Any language with C FFI support
+//!
+//! ## Further Reading
+//!
+//! - See the main Rust API documentation for detailed explanations of concepts
+//! - [`graph`][crate::graph] module: Core stack graph data structures
+//! - [`partial`][crate::partial] module: Partial paths
+//! - [`stitching`][crate::stitching] module: Path stitching algorithm
 
 #![allow(non_camel_case_types)]
 

@@ -5,33 +5,129 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
-//! Partial paths are "snippets" of paths that we can precalculate for each file that we analyze.
+//! Partial paths enable incremental name resolution by precomputing path fragments per file.
 //!
-//! Stack graphs are _incremental_, since we can produce a subgraph for each file without having
-//! to look at the contents of any other file in the repo, or in any upstream or downstream
-//! dependencies.
+//! This module implements the core mechanism that makes stack graphs **incremental**: the ability
+//! to analyze each file independently and cache reusable path fragments.
 //!
-//! This is great, because it means that when we receive a new commit for a repository, we only
-//! have to examine, and generate new stack subgraphs for, the files that are changed as part of
-//! that commit.
+//! ## The Incrementality Problem
 //!
-//! Having done that, one possible way to find name binding paths would be to load in all of the
-//! subgraphs for the files that belong to the current commit, union them together into the
-//! combined graph for that commit, and run the [path-finding algorithm][] on that combined graph.
-//! However, we think that this will require too much computation at query time.
+//! Stack graphs are incremental because we can produce a subgraph for each file without examining
+//! any other files. When a file changes, we only need to reanalyze that one file.
 //!
-//! [path-finding algorithm]: ../paths/index.html
+//! However, finding complete name bindings requires paths that may span multiple files:
 //!
-//! Instead, we want to precompute parts of the path-finding algorithm, by calculating _partial
-//! paths_ for each file.  Because stack graphs have limited places where a path can cross from one
-//! file into another, we can calculate all of the possible partial paths that reach those
-//! “import/export” points.
+//! ```text
+//! File A:                    File B:
+//! import foo from "B"        export function foo() {}
+//!        ^^^                              ^^^
+//!        reference                        definition
+//! ```
 //!
-//! At query time, we can then load in the _partial paths_ for each file, instead of the files'
-//! full stack graph structure.  We can efficiently [concatenate][] partial paths together,
-//! producing the original "full" path that represents a name binding.
+//! A complete path from the reference to the definition must cross file boundaries through
+//! the root node.
 //!
-//! [concatenate]: struct.PartialPath.html#method.concatenate
+//! ## Naive Approach (Not Scalable)
+//!
+//! One approach would be to:
+//! 1. Load all file subgraphs into memory
+//! 2. Union them into one large graph
+//! 3. Run path-finding on the combined graph
+//!
+//! **Problem**: This requires loading and processing entire large codebases at query time,
+//! which is too slow for interactive use.
+//!
+//! ## Partial Paths Solution
+//!
+//! Instead, we precompute **partial paths** - path fragments that:
+//! - Are contained within a single file
+//! - Have pre- and post-conditions on the symbol and scope stacks
+//! - Can be efficiently concatenated at query time
+//!
+//! ### How It Works
+//!
+//! ```text
+//! File A partial paths:
+//!   [reference to foo] → [import edge] → [root node]
+//!   Precondition: symbol_stack = []
+//!   Postcondition: symbol_stack = ["foo"]
+//!
+//! File B partial paths:
+//!   [root node] → [export edge] → [foo definition]
+//!   Precondition: symbol_stack = ["foo"]
+//!   Postcondition: symbol_stack = []
+//!
+//! At query time:
+//!   Concatenate these partial paths to form the complete binding!
+//! ```
+//!
+//! ## Key Concepts
+//!
+//! ### Partial Path Structure
+//!
+//! A partial path consists of:
+//! - **Start and end nodes**: Where the path begins and ends
+//! - **Symbol stack precondition**: Required state before traversing this path
+//! - **Symbol stack postcondition**: Resulting state after traversing this path
+//! - **Scope stack precondition/postcondition**: Same for scope stack
+//! - **Edges**: The actual path through the graph
+//!
+//! ### Stack Variables
+//!
+//! Since partial paths can start/end with non-empty stacks, we use **variables** to represent
+//! unknown stack contents:
+//!
+//! ```text
+//! Partial path for "obj.field":
+//!   Precondition: symbol_stack = [%1]       ← %1 is a variable
+//!   Postcondition: symbol_stack = []
+//!
+//! This path can match any symbol on the stack!
+//! ```
+//!
+//! ### Import/Export Points
+//!
+//! Partial paths are computed between key boundary points:
+//! - Nodes that connect to the root (imports/exports)
+//! - Reference and definition nodes
+//! - Scope boundaries
+//!
+//! ## Performance Benefits
+//!
+//! 1. **Precomputation**: Partial paths computed once per file, cached in database
+//! 2. **Incremental updates**: Only recompute paths for changed files
+//! 3. **Fast queries**: Load only needed partial paths, concatenate them
+//! 4. **Memory efficient**: Don't need full graphs in memory
+//!
+//! ## Usage Example
+//!
+//! ```no_run
+//! use stack_graphs::graph::StackGraph;
+//! use stack_graphs::partial::PartialPaths;
+//! use stack_graphs::NoCancellation;
+//!
+//! let graph = StackGraph::new();
+//! let mut partials = PartialPaths::new();
+//!
+//! // Compute partial paths for a file
+//! # let file = graph.get_or_create_file("example.py");
+//! partials.find_all_partial_paths_in_file(
+//!     &graph,
+//!     file,
+//!     &NoCancellation,
+//!     |_graph, _partials, path| {
+//!         // Each partial path is passed to this callback
+//!         println!("Found partial path");
+//!     }
+//! );
+//! ```
+//!
+//! ## See Also
+//!
+//! - [`PartialPath`] - The partial path data structure
+//! - [`PartialPaths`] - Arena for managing partial paths
+//! - [Path-finding algorithm](../paths/index.html) - Complete path finding
+//! - [Stitching](../stitching/index.html) - Concatenating partial paths
 
 use std::convert::TryFrom;
 use std::fmt::Display;
@@ -147,28 +243,90 @@ where
 //-------------------------------------------------------------------------------------------------
 // Symbol stack variables
 
-/// Represents an unknown list of scoped symbols.
+/// Represents an unknown list of scoped symbols on the symbol stack.
+///
+/// In partial paths, we often don't know the exact contents of the symbol stack. For example,
+/// a partial path for resolving `obj.field` doesn't know what `obj` will be - it could be any
+/// symbol. We use variables to represent these unknown symbols.
+///
+/// ## How Variables Work
+///
+/// Variables act as placeholders that can be unified when concatenating partial paths:
+///
+/// ```text
+/// Partial path 1:
+///   Postcondition: symbol_stack = [%1, "field"]
+///   (Pushed "field", but %1 is unknown)
+///
+/// Partial path 2:
+///   Precondition: symbol_stack = [%2, "field"]
+///   (Expects some symbol %2 and "field")
+///
+/// When concatenating:
+///   %1 and %2 can unify - they represent the same unknown symbol!
+/// ```
+///
+/// ## Variable Lifetime
+///
+/// Variables are scoped to a single partial path. When concatenating paths, we apply offsets
+/// to ensure variables from different paths don't collide.
+///
+/// ## Memory Layout
+///
+/// Uses `NonZeroU32` internally, allowing `Option<SymbolStackVariable>` to be space-efficient
+/// (same size as `SymbolStackVariable`).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Niche, Ord, PartialEq, PartialOrd)]
 pub struct SymbolStackVariable(#[niche] NonZeroU32);
 
 impl SymbolStackVariable {
+    /// Creates a new symbol stack variable with the given ID.
+    ///
+    /// Returns `None` if the variable ID is 0 (reserved as the "null" value).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use stack_graphs::partial::SymbolStackVariable;
+    /// let var1 = SymbolStackVariable::new(1).unwrap();
+    /// let var2 = SymbolStackVariable::new(2).unwrap();
+    /// assert_ne!(var1, var2);
+    /// ```
     pub fn new(variable: u32) -> Option<SymbolStackVariable> {
         NonZeroU32::new(variable).map(SymbolStackVariable)
     }
 
-    /// Creates a new symbol stack variable.  This constructor is used when creating a new, empty
-    /// partial path, since there aren't any other variables that we need to be fresher than.
+    /// Creates the initial symbol stack variable for a new partial path.
+    ///
+    /// This returns variable %1, which is used when creating a new partial path that doesn't
+    /// need to coordinate with any existing variables.
     pub(crate) fn initial() -> SymbolStackVariable {
         SymbolStackVariable(unsafe { NonZeroU32::new_unchecked(1) })
     }
 
-    /// Applies an offset to this variable.
+    /// Applies an offset to this variable to avoid collisions when concatenating paths.
     ///
-    /// When concatenating partial paths, we have to ensure that the left- and right-hand sides
-    /// have non-overlapping sets of variables.  To do this, we find the maximum value of any
-    /// variable on the left-hand side, and add this “offset” to the values of all of the variables
-    /// on the right-hand side.
+    /// When concatenating two partial paths, we need to ensure their variables don't overlap.
+    /// We do this by:
+    /// 1. Finding the maximum variable ID on the left-hand side
+    /// 2. Adding that value as an offset to all variables on the right-hand side
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// Left path uses variables: %1, %2
+    /// Right path uses variables: %1, %2
+    ///
+    /// After applying offset of 2:
+    /// Left: %1, %2
+    /// Right: %3, %4  (offset applied)
+    /// No collisions!
+    /// ```
+    ///
+    /// # Parameters
+    ///
+    /// - `symbol_variable_offset`: The offset to add (typically the max variable ID from the
+    ///   left-hand side path)
     pub fn with_offset(self, symbol_variable_offset: u32) -> SymbolStackVariable {
         let offset_value = self.0.get() + symbol_variable_offset;
         SymbolStackVariable(unsafe { NonZeroU32::new_unchecked(offset_value) })
@@ -212,7 +370,30 @@ impl TryFrom<u32> for SymbolStackVariable {
 //-------------------------------------------------------------------------------------------------
 // Scope stack variables
 
-/// Represents an unknown list of exported scopes.
+/// Represents an unknown list of exported scopes on the scope stack.
+///
+/// Similar to [`SymbolStackVariable`], but for the scope stack. Scope stack variables represent
+/// unknown scopes that may be on the scope stack when a partial path is traversed.
+///
+/// ## Use Cases
+///
+/// Scope variables are used for:
+/// - Paths that jump to unknown parent scopes
+/// - Paths that push scopes for later reference
+/// - Modeling lexical scoping where the exact scope chain is unknown
+///
+/// ## Variable Freshness
+///
+/// When creating new scope variables, we ensure they're "fresher than" (have higher IDs than)
+/// existing variables. This prevents accidental unification of unrelated scopes.
+///
+/// ## Example
+///
+/// ```text
+/// Partial path through nested scopes:
+///   Precondition: scope_stack = [%1]        ← Unknown parent scope
+///   Postcondition: scope_stack = [%1, %2]   ← Added a new scope %2
+/// ```
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Niche, Ord, PartialEq, PartialOrd)]
 pub struct ScopeStackVariable(#[niche] NonZeroU32);

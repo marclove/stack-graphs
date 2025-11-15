@@ -50,12 +50,40 @@ use crate::utils::equals_option;
 
 /// A handle to an instance of type `T` that was allocated from an [`Arena`][].
 ///
-/// #### Safety
+/// A `Handle<T>` is a type-safe index into an arena. It's essentially a wrapper around a
+/// `NonZeroU32`, providing:
 ///
-/// Because of the type parameter `T`, the compiler can ensure that you don't use a handle for one
-/// type to index into an arena of another type.  However, if you have multiple arenas for the
-/// _same type_, we do not do anything to ensure that you only use a handle with the corresponding
-/// arena.
+/// - **Type safety**: Can't accidentally use a `Handle<Foo>` to index into an `Arena<Bar>`
+/// - **Null pointer optimization**: `Option<Handle<T>>` is the same size as `Handle<T>`
+/// - **Cheap copying**: Handles are just numbers, so copying is trivial
+/// - **Stable references**: Handles remain valid as long as the arena exists
+///
+/// # Examples
+///
+/// ```no_run
+/// # use stack_graphs::arena::{Arena, Handle};
+/// let mut arena: Arena<String> = Arena::new();
+/// let handle1 = arena.add("hello".to_string());
+/// let handle2 = arena.add("world".to_string());
+///
+/// // Handles can be compared for equality
+/// assert_ne!(handle1, handle2);
+///
+/// // Dereference via the arena
+/// assert_eq!(&arena[handle1], "hello");
+/// ```
+///
+/// # Safety Considerations
+///
+/// Because of the type parameter `T`, the compiler ensures that you don't use a handle for one
+/// type to index into an arena of another type. However, if you have multiple arenas for the
+/// _same type_, we do **not** prevent you from using a handle from one arena with a different
+/// arena. This will likely lead to panics or incorrect data access.
+///
+/// # Memory Layout
+///
+/// The handle is represented as a `NonZeroU32` index (1-indexed). Index 0 is reserved as the
+/// "null" value, allowing `Option<Handle<T>>` to be represented without extra space.
 #[repr(transparent)]
 pub struct Handle<T> {
     index: NonZeroU32,
@@ -157,44 +185,145 @@ impl<T> PartialOrd for Handle<T> {
 unsafe impl<T> Send for Handle<T> {}
 unsafe impl<T> Sync for Handle<T> {}
 
-/// Manages the life cycle of instances of type `T`.  You can allocate new instances of `T` from
-/// the arena.  All of the instances managed by this arena will be dropped as a single operation
-/// when the arena itself is dropped.
+/// Manages the life cycle of instances of type `T`.
+///
+/// An `Arena<T>` stores all instances of type `T` in a single contiguous vector. This provides:
+///
+/// - **Cache-friendly access**: All instances are stored together in memory
+/// - **Stable handles**: Handles remain valid (we never resize/move the vector contents)
+/// - **Bulk deallocation**: All instances are freed in one operation when the arena is dropped
+/// - **No individual deletion**: You cannot remove a single item from the arena
+///
+/// # How It Works
+///
+/// ```text
+/// Arena<String>:
+///   items: [
+///     [0] = (unused - index 0 is reserved)
+///     [1] = "hello"    ← Handle with index 1
+///     [2] = "world"    ← Handle with index 2
+///     [3] = "foo"      ← Handle with index 3
+///   ]
+/// ```
+///
+/// # Memory Management
+///
+/// The arena uses `MaybeUninit<T>` internally to allow index 0 to remain uninitialized
+/// (it's never accessed). Indices 1 and above contain properly initialized values.
+///
+/// When the arena is dropped, all initialized items (indices 1+) are properly dropped
+/// via the custom `Drop` implementation.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use stack_graphs::arena::Arena;
+/// let mut arena = Arena::new();
+///
+/// let h1 = arena.add("first".to_string());
+/// let h2 = arena.add("second".to_string());
+///
+/// assert_eq!(&arena[h1], "first");
+/// assert_eq!(&arena[h2], "second");
+/// ```
+///
+/// # Performance
+///
+/// - `add`: O(1) amortized (may reallocate vector)
+/// - `get`: O(1) direct indexing
+/// - Access patterns are cache-friendly due to contiguous storage
 pub struct Arena<T> {
+    /// Storage for all arena items. Index 0 is unused (reserved for null handles).
+    /// Items at indices 1+ are initialized.
     items: Vec<MaybeUninit<T>>,
 }
 
 impl<T> Drop for Arena<T> {
+    /// Drops all initialized items in the arena.
+    ///
+    /// This custom drop implementation ensures that all items at indices 1+ are properly
+    /// dropped. We skip index 0 because it's never initialized.
+    ///
+    /// # Safety
+    ///
+    /// This is safe because:
+    /// - We only drop items[1..], skipping the uninitialized item at index 0
+    /// - All items at indices 1+ were initialized via `add()`
+    /// - We transmute `MaybeUninit<T>` to `T`, which is valid for initialized data
     fn drop(&mut self) {
         unsafe {
+            // Get a mutable slice of all initialized items (skip index 0)
             let items = std::mem::transmute::<_, &mut [T]>(&mut self.items[1..]) as *mut [T];
+            // Drop all items in-place
             items.drop_in_place();
         }
     }
 }
 
 impl<T> Arena<T> {
-    /// Creates a new arena.
+    /// Creates a new, empty arena.
+    ///
+    /// The arena starts with a single uninitialized slot at index 0 (which is never used).
+    /// This allows us to use 0 as the "null" value for `Option<Handle<T>>`.
     pub fn new() -> Arena<T> {
         Arena {
             items: vec![MaybeUninit::uninit()],
         }
     }
 
-    /// Clear the arena, keeping underlying allocated capacity.  After this, all previous handles into
-    /// the arena are invalid.
+    /// Clears the arena, keeping the underlying allocated capacity.
+    ///
+    /// After calling this, all previous handles into the arena become invalid.
+    /// Using an old handle after `clear()` may panic or return incorrect data.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use stack_graphs::arena::Arena;
+    /// let mut arena = Arena::new();
+    /// let h1 = arena.add(42);
+    ///
+    /// arena.clear();
+    ///
+    /// // h1 is now invalid!
+    /// // Using arena[h1] would be incorrect
+    /// ```
     #[inline(always)]
     pub fn clear(&mut self) {
+        // Keep index 0 (the unused slot), truncate everything else
         self.items.truncate(1);
     }
 
     /// Adds a new instance to this arena, returning a stable handle to it.
     ///
-    /// Note that we do not deduplicate instances of `T` in any way.  If you add two instances that
-    /// have the same content, you will get distinct handles for each one.
+    /// The arena does **not** deduplicate instances. If you add two instances with the same
+    /// content, you'll get two distinct handles.
+    ///
+    /// # Performance
+    ///
+    /// This operation is O(1) amortized. The vector may need to reallocate occasionally,
+    /// but handles remain valid across reallocations because we use indices, not pointers.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use stack_graphs::arena::Arena;
+    /// let mut arena = Arena::new();
+    ///
+    /// let h1 = arena.add(42);
+    /// let h2 = arena.add(42);  // Same value, different handle
+    ///
+    /// assert_ne!(h1, h2);  // Different handles
+    /// assert_eq!(arena[h1], arena[h2]);  // Same value
+    /// ```
     pub fn add(&mut self, item: T) -> Handle<T> {
+        // Get the index for the new item (current length)
         let index = self.items.len() as u32;
+
+        // Add the item to the arena
         self.items.push(MaybeUninit::new(item));
+
+        // Create a handle with the index (safe because index is never 0)
         Handle::new(unsafe { NonZeroU32::new_unchecked(index) })
     }
 

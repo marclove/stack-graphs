@@ -5,6 +5,241 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
+//! SQLite-based persistent storage for stack graphs and partial paths.
+//!
+//! This module provides a SQLite database backend for storing stack graphs and partial paths,
+//! enabling incremental analysis by caching analysis results between runs.
+//!
+//! ## Overview
+//!
+//! The storage module solves a critical problem: for large repositories, rebuilding stack
+//! graphs from scratch on every run is prohibitively expensive. Instead, we:
+//!
+//! 1. **Cache per-file results**: Store the stack graph and partial paths for each file
+//! 2. **Track file versions**: Use content hashes (tags) to detect when files change
+//! 3. **Invalidate selectively**: Only reanalyze files that have changed
+//! 4. **Query efficiently**: Quickly load just the data needed for a query
+//!
+//! ## Architecture
+//!
+//! ### Database Schema
+//!
+//! The database has three main tables:
+//!
+//! - **`graphs`**: Stores serialized stack graph data per file
+//!   - `file`: File path (primary key)
+//!   - `tag`: Content hash or version identifier
+//!   - `error`: Error message if indexing failed
+//!   - `value`: Serialized graph data (bincode blob)
+//!
+//! - **`file_paths`**: Stores partial paths that start/end within a file
+//!   - `file`: The file this path belongs to
+//!   - `local_id`: Path identifier within the file
+//!   - `value`: Serialized partial path (bincode blob)
+//!
+//! - **`root_paths`**: Stores partial paths that cross file boundaries
+//!   - `file`: The file this path starts in
+//!   - `symbol_stack`: Serialized symbol stack state for matching
+//!   - `value`: Serialized partial path (bincode blob)
+//!
+//! ### Two-Phase API
+//!
+//! The module provides separate reader and writer types:
+//!
+//! - **[`SQLiteWriter`][]**: For writing/updating data
+//!   - Create database
+//!   - Store graphs and paths
+//!   - Batch operations
+//!
+//! - **[`SQLiteReader`][]**: For querying data
+//!   - Load graphs and paths
+//!   - Check file status
+//!   - Efficient filtering
+//!
+//! This separation ensures safe concurrent access (multiple readers, single writer).
+//!
+//! ## Basic Usage
+//!
+//! ### Storing Data
+//!
+//! ```rust,ignore
+//! use stack_graphs::storage::SQLiteWriter;
+//! use stack_graphs::graph::StackGraph;
+//! use stack_graphs::partial::PartialPaths;
+//!
+//! // Create a new database
+//! let mut writer = SQLiteWriter::open("graphs.db")?;
+//!
+//! // Build a stack graph for a file
+//! let mut graph = StackGraph::new();
+//! let file = graph.get_or_create_file("src/main.rs");
+//! // ... build the graph ...
+//!
+//! // Compute partial paths
+//! let mut partials = PartialPaths::new();
+//! partials.find_all_partial_paths_in_file(
+//!     &graph,
+//!     file,
+//!     &NoCancellation,
+//!     |_, _, _| {}
+//! )?;
+//!
+//! // Store in database with a version tag
+//! writer.store_result_for_file(
+//!     &graph,
+//!     "src/main.rs",
+//!     "content-hash-abc123",  // Content hash or version
+//!     Result::<(), String>::Ok(()),  // No error
+//! )?;
+//!
+//! writer.store_partials_for_file(
+//!     &graph,
+//!     &mut partials,
+//!     "src/main.rs",
+//! )?;
+//! ```
+//!
+//! ### Loading Data
+//!
+//! ```rust,ignore
+//! use stack_graphs::storage::SQLiteReader;
+//!
+//! // Open the database
+//! let reader = SQLiteReader::open("graphs.db")?;
+//!
+//! // Check if a file is up-to-date
+//! match reader.status_for_file("src/main.rs")? {
+//!     FileStatus::Missing => {
+//!         // Need to analyze this file
+//!     }
+//!     FileStatus::Indexed if reader.file_tag("src/main.rs")? == current_hash => {
+//!         // File hasn't changed, load from database
+//!         let mut graph = StackGraph::new();
+//!         let mut partials = PartialPaths::new();
+//!
+//!         reader.load_graph_for_file(&mut graph, "src/main.rs")?;
+//!         reader.load_partials_for_file(&graph, &mut partials, "src/main.rs")?;
+//!     }
+//!     FileStatus::Error(msg) => {
+//!         // Previous indexing failed
+//!     }
+//!     _ => {
+//!         // File changed, need to reanalyze
+//!     }
+//! }
+//! ```
+//!
+//! ## Incremental Workflow
+//!
+//! Typical incremental analysis workflow:
+//!
+//! ```rust,ignore
+//! use stack_graphs::storage::{SQLiteReader, SQLiteWriter};
+//!
+//! let reader = SQLiteReader::open("graphs.db")?;
+//! let mut writer = SQLiteWriter::open("graphs.db")?;
+//!
+//! for file_path in source_files {
+//!     let current_hash = compute_content_hash(&file_path);
+//!
+//!     // Check if we can reuse cached data
+//!     let needs_update = match reader.status_for_file(&file_path)? {
+//!         FileStatus::Missing => true,
+//!         FileStatus::Indexed => {
+//!             reader.file_tag(&file_path)? != current_hash
+//!         }
+//!         FileStatus::Error(_) => true,
+//!     };
+//!
+//!     if needs_update {
+//!         // Reanalyze file
+//!         let (graph, partials) = analyze_file(&file_path)?;
+//!
+//!         // Update database
+//!         writer.store_result_for_file(
+//!             &graph,
+//!             &file_path,
+//!             &current_hash,
+//!             Result::<(), String>::Ok(()),
+//!         )?;
+//!         writer.store_partials_for_file(&graph, &mut partials, &file_path)?;
+//!     }
+//! }
+//! ```
+//!
+//! ## Performance Considerations
+//!
+//! ### WAL Mode
+//!
+//! The database uses Write-Ahead Logging (WAL) mode for better concurrency:
+//! - Multiple readers can read while a writer writes
+//! - Reduced lock contention
+//! - Better performance for read-heavy workloads
+//!
+//! ### Batching
+//!
+//! Use batching for bulk operations:
+//!
+//! ```rust,ignore
+//! // Batch stores for better performance
+//! let mut batch = writer.batch_writer()?;
+//! for file in files {
+//!     batch.store_result_for_file(&graph, &file, &tag, Ok(()))?;
+//! }
+//! batch.commit()?;  // Single transaction
+//! ```
+//!
+//! ### Selective Loading
+//!
+//! Only load what you need:
+//!
+//! ```rust,ignore
+//! // Load just the graph (no partial paths)
+//! reader.load_graph_for_file(&mut graph, "src/main.rs")?;
+//!
+//! // Load partial paths for specific files only
+//! for file in needed_files {
+//!     reader.load_partials_for_file(&graph, &mut partials, file)?;
+//! }
+//! ```
+//!
+//! ## Error Handling
+//!
+//! The module defines [`StorageError`][] for all failure cases:
+//!
+//! - **Database errors**: SQLite failures, schema mismatches
+//! - **Serialization errors**: Failed to encode/decode data
+//! - **Cancellation**: Operation was cancelled
+//! - **Version mismatches**: Database schema version incompatible
+//!
+//! ## Thread Safety
+//!
+//! - **SQLiteReader**: Safe to share across threads (implements `Send`)
+//! - **SQLiteWriter**: Not thread-safe, use one writer at a time
+//! - **Concurrent access**: WAL mode allows multiple readers + one writer
+//!
+//! ## Database Versioning
+//!
+//! The database includes a version number. If the schema changes in a new version
+//! of the library:
+//! - Opening an old database returns `StorageError::IncorrectVersion`
+//! - You must recreate the database or migrate data
+//!
+//! ## Cargo Features
+//!
+//! This module requires the `storage` cargo feature:
+//!
+//! ```toml
+//! [dependencies]
+//! stack-graphs = { version = "...", features = ["storage"] }
+//! ```
+//!
+//! ## See Also
+//!
+//! - [`serde`][crate::serde]: Serialization formats used by storage
+//! - [`partial`][crate::partial]: Partial paths that are stored
+//! - [`stitching`][crate::stitching]: How stored paths are used in queries
+
 use bincode::error::DecodeError;
 use bincode::error::EncodeError;
 use itertools::Itertools;

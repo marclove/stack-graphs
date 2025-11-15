@@ -67,30 +67,76 @@ use crate::arena::SupplementalArena;
 //-------------------------------------------------------------------------------------------------
 // String content
 
+/// Internal representation of an interned string's content.
+///
+/// This structure holds a raw pointer to UTF-8 bytes and their length. It's marked `#[repr(C)]`
+/// for FFI compatibility. The pointer is guaranteed to be valid as long as the
+/// `InternedStringArena` that created it exists.
+///
+/// # Safety
+///
+/// The raw pointer is safe to use because:
+/// 1. The `InternedStringArena` never reallocates its buffers (they're append-only)
+/// 2. All `InternedStringContent` instances are stored in an arena with the same lifetime
+/// 3. We never hand out the pointer directly, only through safe `&str` references
 #[repr(C)]
 struct InternedStringContent {
-    // See InternedStringArena below for how we fill in these fields safely.
+    /// Pointer to the first byte of the UTF-8 string data.
+    /// Points into one of the buffers in the `InternedStringArena`.
     start: *const u8,
+    /// Length of the string in bytes.
     len: usize,
 }
 
+/// Initial capacity for string intern buffers.
+/// This is the size of the first buffer; subsequent buffers grow exponentially.
 const INITIAL_STRING_CAPACITY: usize = 512;
 
-/// The content of each interned string is stored in one of the buffers inside of a
-/// `InternedStringArena` instance, following the trick [described by Aleksey Kladov][interner].
+/// Arena for interning strings efficiently.
 ///
-/// The buffers stored in this type are preallocated, and are never allowed to grow.  That ensures
-/// that pointers into the buffer are stable, as long as the buffer has not been destroyed.
-/// (`InternedStringContent` instances are also stored in an arena, ensuring that the strings that
-/// we hand out don't outlive the buffers.)
+/// This structure implements a string interner that guarantees stable pointers to string data.
+/// It uses a clever technique [described by Aleksey Kladov][interner] where strings are stored
+/// in pre-allocated buffers that are never resized. When a buffer fills up, a new (larger)
+/// buffer is allocated and the old one is kept around.
+///
+/// ## How It Works
+///
+/// 1. Strings are appended to `current_buffer` until it's full
+/// 2. When full, `current_buffer` is moved to `full_buffers` (preserving its address)
+/// 3. A new, larger `current_buffer` is allocated (sized to fit the next string)
+/// 4. Because buffers are never reallocated, pointers into them remain valid
+///
+/// ## Memory Layout
+///
+/// ```text
+/// full_buffers: [
+///   [s₁, s₂, s₃]  ← first buffer (512 bytes)
+///   [s₄, s₅]       ← second buffer (1024 bytes)
+/// ]
+/// current_buffer: [s₆, ...] ← actively being filled
+/// ```
+///
+/// ## Thread Safety
+///
+/// The `InternedStringContent` type implements `Send + Sync` (see below), allowing the
+/// stack graph to be shared across threads. The raw pointers are safe because the buffers
+/// are never deallocated until the entire arena is dropped.
 ///
 /// [interner]: https://matklad.github.io/2020/03/22/fast-simple-rust-interner.html
 struct InternedStringArena {
+    /// The buffer currently being filled with new strings.
+    /// Never resized - when full, it's moved to `full_buffers`.
     current_buffer: Vec<u8>,
+    /// Previously filled buffers that are kept alive to preserve pointer stability.
+    /// These are never modified or deallocated until the arena is dropped.
     full_buffers: Vec<Vec<u8>>,
 }
 
 impl InternedStringArena {
+    /// Creates a new string interning arena.
+    ///
+    /// The arena starts with a single buffer of `INITIAL_STRING_CAPACITY` bytes.
+    /// Additional buffers are allocated as needed, each time doubling in size.
     fn new() -> InternedStringArena {
         InternedStringArena {
             current_buffer: Vec::with_capacity(INITIAL_STRING_CAPACITY),
@@ -98,53 +144,134 @@ impl InternedStringArena {
         }
     }
 
-    // Adds a new string.  This does not check whether we've already stored a string with the same
-    // content; that is handled down below in `StackGraph::add_symbol` and `add_file`.
+    /// Interns a new string, returning a stable pointer to its content.
+    ///
+    /// This method does NOT check for duplicates - deduplication is handled by
+    /// `StackGraph::add_symbol` and `StackGraph::add_file` which maintain hash maps
+    /// of previously interned strings.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Check if the string fits in the current buffer
+    /// 2. If not, archive the current buffer and allocate a new, larger one
+    /// 3. Append the string to the current buffer
+    /// 4. Return a pointer to the appended string
+    ///
+    /// # Pointer Stability
+    ///
+    /// The returned pointer remains valid because:
+    /// - We never resize buffers (which would invalidate pointers)
+    /// - Old buffers are preserved in `full_buffers` until the arena is dropped
+    /// - The current buffer is pre-allocated to its final size
+    ///
+    /// # Example
+    ///
+    /// ```text
+    /// Before adding "hello":
+    ///   current_buffer: [existing...] capacity=512
+    ///
+    /// After adding "hello":
+    ///   current_buffer: [existing..."hello"] capacity=512
+    ///                             ^
+    ///                             returned pointer points here
+    /// ```
     fn add(&mut self, value: &str) -> InternedStringContent {
-        // Is there enough room in current_buffer to hold this string?
+        // Convert the string to bytes for storage
         let value = value.as_bytes();
         let len = value.len();
+
+        // Check if there's enough room in the current buffer
         let capacity = self.current_buffer.capacity();
         let remaining_capacity = capacity - self.current_buffer.len();
+
         if len > remaining_capacity {
-            // If not, move current_buffer over into full_buffers (so that we hang onto it until
-            // we're dropped) and allocate a new current_buffer that's at least big enough to hold
-            // this string.
+            // Not enough space! We need to archive the current buffer and allocate a new one.
+            //
+            // Calculate the new buffer size:
+            // 1. Take the max of current capacity and the string length
+            // 2. Add 1 to avoid edge cases with zero-sized strings
+            // 3. Round up to next power of 2 for efficient allocation
+            //
+            // This ensures exponential growth: 512 → 1024 → 2048 → ...
             let new_capacity = (capacity.max(len) + 1).next_power_of_two();
             let new_buffer = Vec::with_capacity(new_capacity);
+
+            // Move the current buffer into full_buffers to preserve it
+            // (and all the pointers into it). Replace it with the new buffer.
             let old_buffer = std::mem::replace(&mut self.current_buffer, new_buffer);
             self.full_buffers.push(old_buffer);
         }
 
-        // Copy the string's content into current_buffer and return a pointer to it.  That pointer
-        // is stable since we never allow the current_buffer to be resized — once we run out of
-        // room, we allocate a _completely new buffer_ to replace it.
+        // At this point, current_buffer has enough capacity for our string.
+        // Remember where the string will start (before we add it).
         let start_index = self.current_buffer.len();
+
+        // Append the string's bytes to the buffer.
         self.current_buffer.extend_from_slice(value);
+
+        // Create a pointer to the start of the string we just added.
+        // This is safe because:
+        // - current_buffer is pre-allocated and won't be reallocated
+        // - We're creating a pointer to data we just added
+        // - The buffer will live as long as the arena
         let start = unsafe { self.current_buffer.as_ptr().add(start_index) };
+
         InternedStringContent { start, len }
     }
 }
 
 impl InternedStringContent {
-    /// Returns the content of this string as a `str`.  This is safe as long as the lifetime of the
-    /// InternedStringContent is outlived by the lifetime of the InternedStringArena that holds its
-    /// data.  That is guaranteed because we store the InternedStrings in an Arena alongside the
-    /// InternedStringArena, and only hand out references to them.
+    /// Returns the content of this interned string as a `&str`.
+    ///
+    /// # Safety
+    ///
+    /// This is safe as long as the `InternedStringContent` doesn't outlive the
+    /// `InternedStringArena` that created it. We guarantee this by:
+    ///
+    /// 1. Storing `InternedStringContent` in the `InternedStringArena`
+    /// 2. Only handing out references (never owned values)
+    /// 3. Both arenas having the same lifetime (tied to the `StackGraph`)
+    ///
+    /// The unsafe code reconstructs a byte slice from the raw pointer, then converts
+    /// it to a string slice. This is safe because the original string was valid UTF-8,
+    /// and the bytes haven't been modified.
     fn as_str(&self) -> &str {
         unsafe {
+            // Reconstruct a byte slice from the raw pointer and length
             let bytes = std::slice::from_raw_parts(self.start, self.len);
+            // Convert bytes to str (safe because we only store valid UTF-8)
             std::str::from_utf8_unchecked(bytes)
         }
     }
 
-    // Returns a supposedly 'static reference to the string's data.  The string data isn't really
-    // static, but we are careful only to use this as a key in the HashMap that StackGraph uses to
-    // track whether we've stored a particular symbol already.  That HashMap lives alongside the
-    // InternedStringArena that holds the data, so we can get away with a technically incorrect
-    // 'static lifetime here.  As an extra precaution, this method is is marked as unsafe so that
-    // we don't inadvertently call it from anywhere else in the crate.
+    /// Returns a 'static reference to the string data for use as a HashMap key.
+    ///
+    /// # Safety
+    ///
+    /// The returned string doesn't actually have a 'static lifetime, but we can use this
+    /// trick because:
+    ///
+    /// 1. The returned reference is **only** used as a key in the `symbol_handles` or
+    ///    `string_handles` HashMap
+    /// 2. That HashMap lives in the same `StackGraph` as the `InternedStringArena`
+    /// 3. The HashMap never outlives the arena, so the pointer remains valid
+    ///
+    /// This method is intentionally marked `unsafe` to prevent accidental misuse elsewhere
+    /// in the crate. The 'static lifetime is a "white lie" to satisfy the HashMap's
+    /// requirements for key lifetimes.
+    ///
+    /// # Example Usage
+    ///
+    /// ```text
+    /// // In StackGraph::add_symbol:
+    /// let hash_key = unsafe { interned.as_hash_key() };
+    /// self.symbol_handles.insert(hash_key, handle);
+    /// //                           ^^^^^^^^
+    /// //                           HashMap borrows the key, but both HashMap
+    /// //                           and arena live in self, so it's safe
+    /// ```
     unsafe fn as_hash_key(&self) -> &'static str {
+        // Reconstruct the string with a falsely extended lifetime
         let bytes = std::slice::from_raw_parts(self.start, self.len);
         std::str::from_utf8_unchecked(bytes)
     }
@@ -172,6 +299,16 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    /// Returns the string content of this symbol.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use stack_graphs::graph::StackGraph;
+    /// let mut graph = StackGraph::new();
+    /// let greeting_symbol = graph.add_symbol("greeting");
+    /// assert_eq!(graph[greeting_symbol], "greeting");
+    /// ```
     pub fn as_str(&self) -> &str {
         self.content.as_str()
     }
@@ -184,18 +321,53 @@ impl PartialEq<&str> for Symbol {
 }
 
 impl StackGraph {
-    /// Adds a symbol to the stack graph, ensuring that there's only ever one copy of a particular
-    /// symbol stored in the graph.
+    /// Adds a symbol to the stack graph, deduplicating if it already exists.
+    ///
+    /// Symbols are automatically deduplicated: if you add the same symbol string multiple
+    /// times, you'll get the same handle each time. This allows you to compare symbol handles
+    /// for equality without dereferencing them through the graph.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use stack_graphs::graph::StackGraph;
+    /// let mut graph = StackGraph::new();
+    ///
+    /// let hello1 = graph.add_symbol("hello");
+    /// let hello2 = graph.add_symbol("hello");
+    ///
+    /// // Same symbol string produces the same handle
+    /// assert_eq!(hello1, hello2);
+    ///
+    /// let world = graph.add_symbol("world");
+    /// assert_ne!(hello1, world);
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// - First call for a symbol: O(n) where n is the length of the symbol string
+    /// - Subsequent calls for the same symbol: O(1) hash map lookup
     pub fn add_symbol<S: AsRef<str> + ?Sized>(&mut self, symbol: &S) -> Handle<Symbol> {
         let symbol = symbol.as_ref();
+
+        // Check if we've already interned this symbol
         if let Some(handle) = self.symbol_handles.get(symbol) {
-            return *handle;
+            return *handle;  // Return the existing handle
         }
 
+        // New symbol: intern the string
         let interned = self.interned_strings.add(symbol);
+
+        // Get a hash key with 'static lifetime for the HashMap
+        // (Safe because the HashMap and arena have the same lifetime)
         let hash_key = unsafe { interned.as_hash_key() };
+
+        // Create the Symbol and get its handle
         let handle = self.symbols.add(Symbol { content: interned });
+
+        // Store the handle for future lookups
         self.symbol_handles.insert(hash_key, handle);
+
         handle
     }
 
@@ -1475,20 +1647,133 @@ impl std::ops::AddAssign for Degree {
 }
 
 /// Contains all of the nodes and edges that make up a stack graph.
+///
+/// A `StackGraph` is the central data structure for representing the name binding structure
+/// of source code across one or more files. It consists of:
+///
+/// - **Nodes**: Various types (scope, push/pop symbol, etc.) that encode name binding rules
+/// - **Edges**: Connections between nodes that form potential name binding paths
+/// - **Files**: Organizational units that group nodes from the same source file
+/// - **Symbols**: Deduplicated strings representing names in the source code
+///
+/// # Memory Management
+///
+/// The stack graph uses arena-based allocation, which means:
+///
+/// - All nodes, symbols, and strings are allocated in bulk arenas
+/// - References are handles (type-safe indices) rather than pointers
+/// - Individual items cannot be deleted (only the entire graph)
+/// - All memory is freed in a single operation when the graph is dropped
+///
+/// This design provides:
+/// - Fast allocation (no individual malloc/free calls)
+/// - Memory safety (handles can't dangle)
+/// - Good cache locality
+/// - Simple lifetime management
+///
+/// # Thread Safety
+///
+/// `StackGraph` implements `Send + Sync` (because `InternedStringContent` does), allowing
+/// it to be shared across threads. However, most operations require `&mut self`, so you'll
+/// need synchronization (like a `Mutex`) for concurrent access.
+///
+/// # Example
+///
+/// ```no_run
+/// use stack_graphs::graph::{StackGraph, NodeID};
+///
+/// // Create a new empty stack graph
+/// let mut graph = StackGraph::new();
+///
+/// // Add a file
+/// let file = graph.get_or_create_file("example.py");
+///
+/// // Add a symbol
+/// let greeting_sym = graph.add_symbol("greeting");
+///
+/// // Create nodes
+/// let scope = graph.add_scope_node_for_file(
+///     file,
+///     0,
+///     false
+/// ).unwrap();
+///
+/// let definition = graph.add_pop_symbol_node(
+///     NodeID::new_in_file(file, 1),
+///     greeting_sym,
+///     true  // is_definition
+/// ).unwrap();
+///
+/// // Connect them with an edge
+/// graph.add_edge(scope, definition, 0);
+/// ```
+///
+/// # Structure
+///
+/// The fields of this struct are organized by purpose:
+///
+/// **String Management:**
+/// - `interned_strings`: Arena for string data
+/// - `symbols`: Deduplicated symbols
+/// - `symbol_handles`: Fast lookup for existing symbols
+/// - `strings`: Other interned strings (not symbols)
+/// - `string_handles`: Fast lookup for existing strings
+///
+/// **File Management:**
+/// - `files`: All files in the graph
+/// - `file_handles`: Fast lookup for existing files
+///
+/// **Node Management:**
+/// - `nodes`: All nodes in the graph (including root and jump-to)
+/// - `node_id_handles`: Mapping from NodeID to Handle<Node>
+/// - `source_info`: Optional source location info for nodes
+/// - `node_debug_info`: Optional debug metadata for nodes
+///
+/// **Edge Management:**
+/// - `outgoing_edges`: For each node, its outgoing edges
+/// - `incoming_edges`: For each node, count of incoming edges
+/// - `edge_debug_info`: Optional debug metadata for edges
 pub struct StackGraph {
+    /// String interning arena for stable pointers.
     interned_strings: InternedStringArena,
+
+    /// Arena of all symbols (deduplicated symbol strings).
     pub(crate) symbols: Arena<Symbol>,
+
+    /// Fast lookup table: symbol string → symbol handle.
     symbol_handles: FxHashMap<&'static str, Handle<Symbol>>,
+
+    /// Arena of all non-symbol interned strings.
     pub(crate) strings: Arena<InternedString>,
+
+    /// Fast lookup table: string → string handle.
     string_handles: FxHashMap<&'static str, Handle<InternedString>>,
+
+    /// Arena of all files referenced in the graph.
     pub(crate) files: Arena<File>,
+
+    /// Fast lookup table: file path → file handle.
     file_handles: FxHashMap<&'static str, Handle<File>>,
+
+    /// Arena of all nodes (scope, push/pop symbol, root, etc.).
     pub(crate) nodes: Arena<Node>,
+
+    /// Optional source location information for each node.
     pub(crate) source_info: SupplementalArena<Node, SourceInfo>,
+
+    /// Bidirectional mapping between NodeID and Handle<Node>.
     node_id_handles: NodeIDHandles,
+
+    /// For each node, list of outgoing edges (stored as small vectors for efficiency).
     outgoing_edges: SupplementalArena<Node, SmallVec<[OutgoingEdge; 4]>>,
+
+    /// For each node, degree of incoming edges (Zero, One, or Multiple).
     incoming_edges: SupplementalArena<Node, Degree>,
+
+    /// Optional debug metadata for nodes (key-value pairs).
     pub(crate) node_debug_info: SupplementalArena<Node, DebugInfo>,
+
+    /// Optional debug metadata for edges (indexed by source node and sink node).
     pub(crate) edge_debug_info: SupplementalArena<Node, SmallVec<[(Handle<Node>, DebugInfo); 4]>>,
 }
 

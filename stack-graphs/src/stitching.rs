@@ -5,35 +5,160 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
-//! Partial paths can be "stitched together" to produce name-binding paths.
+//! Path stitching combines partial paths to create complete name-binding paths.
 //!
-//! The "path stitching" algorithm defined in this module is how we take a collection of [partial
-//! paths][] and use them to build up name-binding paths.  Our conjecture is that by building paths
-//! this way, we can precompute a useful amount of work at _index time_ (when we construct the
-//! partial paths), to reduce the amount of work that needs to be done at _query time_ (when those
-//! partial paths are stitched together into paths).
+//! This module implements the core algorithm for **query-time name resolution**: given a
+//! reference, find all definitions it could refer to by stitching together precomputed
+//! [partial paths][].
 //!
-//! Complicating this story is that for large codebases (especially those with many upstream and
-//! downstream dependencies), there is a _very_ large set of partial paths available to us.  We
-//! want to be able to load those in _lazily_, during the execution of the path-stitching
-//! algorithm.
+//! ## The Path Stitching Algorithm
 //!
-//! The [`Database`][] and [`PathStitcher`][] types provide this functionality.  `Database`
-//! manages a collection of partial paths that have been loaded into this process from some
-//! external data store.  `PathStitcher` implements the path-stitching algorithm in _phases_.
-//! During each phase, we will process a set of (possibly incomplete) paths, looking in the
-//! `Database` for the set of partial paths that are compatible with those paths.  It is your
-//! responsibility to make sure that the database contains all of possible extensions of the paths
-//! that we're going to process in that phase.  For the first phase, you already know which
-//! paths you're starting the search from, and must make sure that the database starts out
-//! containing the possible extensions of those "seed" paths.  For subsequent phases, you get to
-//! see which paths will be processed in the _next_ phase as part of handling the _current_ phase.
-//! This gives you the opporunity to load additional partial paths into the `Database` before
-//! allowing the next phase to proceed.
+//! Path stitching works by concatenating compatible partial paths end-to-end until forming
+//! complete bindings (paths with empty stacks at both ends).
+//!
+//! ### Algorithm Overview
+//!
+//! ```text
+//! Start with a reference node:
+//!   [reference to foo]
+//!   symbol_stack: []
+//!
+//! Find compatible partial paths in database:
+//!   Partial path 1: [reference to foo] → [root]
+//!   Postcondition: symbol_stack = ["foo"]
+//!
+//! Stitch it on:
+//!   Current path: [reference to foo] → [root]
+//!   symbol_stack: ["foo"]
+//!
+//! Find next compatible partial paths:
+//!   Partial path 2: [root] → [definition of foo]
+//!   Precondition: symbol_stack = ["foo"]
+//!   Postcondition: symbol_stack = []
+//!
+//! Stitch it on:
+//!   Complete path: [reference to foo] → [root] → [definition of foo]
+//!   symbol_stack: []  ✓ Complete binding found!
+//! ```
+//!
+//! ## Index Time vs Query Time
+//!
+//! Stack graphs split name resolution into two phases:
+//!
+//! **Index Time** (happens once per file):
+//! - Parse source files
+//! - Build stack graphs
+//! - Compute all partial paths
+//! - Store in database
+//!
+//! **Query Time** (happens on every lookup):
+//! - Load relevant partial paths from database
+//! - Stitch them together to find bindings
+//! - Return definitions
+//!
+//! By precomputing partial paths at index time, we drastically reduce query time work.
+//!
+//! ## Lazy Loading
+//!
+//! For large codebases (with many dependencies), there can be millions of partial paths.
+//! Loading them all into memory would be prohibitively expensive.
+//!
+//! Instead, path stitching supports **lazy loading**:
+//!
+//! 1. **Phase-based execution**: The algorithm runs in phases
+//! 2. **Load on demand**: Before each phase, load only the partial paths needed for that phase
+//! 3. **Your control**: You decide what to load based on which paths will be extended
+//!
+//! ### Phase-Based Stitching
+//!
+//! The [`PathStitcher`] implements stitching in phases:
+//!
+//! ```text
+//! Phase 1:
+//!   - Start with seed paths (e.g., from a reference)
+//!   - You load partial paths that could extend the seeds
+//!   - Algorithm extends all paths one step
+//!   - Yields paths for next phase
+//!
+//! Phase 2:
+//!   - You see which paths will be processed
+//!   - You load partial paths that could extend those paths
+//!   - Algorithm extends all paths one step
+//!   - Yields paths for next phase
+//!
+//! ...continue until complete paths found or no more extensions...
+//! ```
+//!
+//! ## Key Components
+//!
+//! ### Database
+//!
+//! [`Database`] manages a collection of partial paths loaded from external storage:
+//! - Stores partial paths by their preconditions for fast lookup
+//! - Supports adding/removing partial paths
+//! - Provides efficient querying for compatible paths
+//!
+//! ### PathStitcher
+//!
+//! [`PathStitcher`] implements the core stitching algorithm:
+//! - Extends paths by concatenating compatible partial paths
+//! - Handles cycle detection
+//! - Manages the phased execution model
+//! - Calls back to your code when complete paths are found
+//!
+//! ### ForwardPartialPathStitcher
+//!
+//! [`ForwardPartialPathStitcher`] is a convenience wrapper that:
+//! - Starts from a reference node
+//! - Stitches forward toward definitions
+//! - Handles all the phases automatically
+//! - Returns complete paths via callback
+//!
+//! ## Example Usage
+//!
+//! ```no_run
+//! use stack_graphs::graph::StackGraph;
+//! use stack_graphs::partial::PartialPaths;
+//! use stack_graphs::stitching::{Database, ForwardPartialPathStitcher};
+//! use stack_graphs::NoCancellation;
+//!
+//! # let graph = StackGraph::new();
+//! # let mut partials = PartialPaths::new();
+//! # let reference_node = graph.root_node();
+//!
+//! // Create a database and load partial paths into it
+//! let mut db = Database::new();
+//! // ... add partial paths to db ...
+//!
+//! // Find all definitions reachable from a reference
+//! ForwardPartialPathStitcher::find_all_complete_paths(
+//!     &graph,
+//!     &mut partials,
+//!     &db,
+//!     reference_node,
+//!     &NoCancellation,
+//!     |graph, partials, path| {
+//!         // Called for each complete path found
+//!         println!("Found binding!");
+//!     }
+//! );
+//! ```
+//!
+//! ## Performance Characteristics
+//!
+//! - **Space**: O(partial paths loaded) - only loaded paths in memory
+//! - **Time per phase**: O(paths × compatible partials)
+//! - **Cycle detection**: Prevents infinite loops
+//! - **Lazy loading**: Enables handling massive codebases
+//!
+//! ## See Also
+//!
+//! - [Partial paths module](../partial/index.html) - How partial paths are computed
+//! - [`Database`] - Manages loaded partial paths
+//! - [`PathStitcher`] - Core stitching algorithm
+//! - [`ForwardPartialPathStitcher`] - Convenience wrapper for forward stitching
 //!
 //! [partial paths]: ../partial/index.html
-//! [`Database`]: struct.Database.html
-//! [`PathStitcher`]: struct.PathStitcher.html
 
 use std::cmp::Ordering;
 use std::collections::HashMap;

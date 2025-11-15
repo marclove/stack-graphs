@@ -5,17 +5,64 @@
 // Please see the LICENSE-APACHE or LICENSE-MIT files in this distribution for license details.
 // ------------------------------------------------------------------------------------------------
 
-//! Stack graphs provide a single framework for performing name resolution for any programming
-//! language, while abstracting away the specific name resolution rules for each of those
-//! languages. The basic idea is to represent the _definitions_ and _references_ in a program using
-//! graph.  A _name binding_ maps a reference to all of the possible definitions that the reference
-//! could refer to.  Because we’ve represented definitions and references as a graph, bindings are
-//! represented by paths within that graph.
+//! # Stack Graphs: Incremental Name Resolution for Any Language
 //!
-//! While searching for a path in an incremental stack graph, we keep track of two stacks: a
-//! _symbol stack_ and a _scope stack_. Broadly speaking, the symbol stack keeps track of what
-//! symbols we’re trying to resolve, while the scope stack gives us control over which particular
-//! scopes we look for those symbols in.
+//! Stack graphs provide a unified framework for performing name resolution (finding where
+//! identifiers are defined) across any programming language. They abstract away language-specific
+//! name resolution rules into a general graph-based model.
+//!
+//! ## Core Concept
+//!
+//! The basic idea is to represent **definitions** and **references** in a program as nodes in a
+//! graph. A **name binding** maps a reference to all possible definitions it could refer to.
+//! Because definitions and references are nodes in a graph, bindings are represented by
+//! **paths** through that graph.
+//!
+//! ## The Two Stacks
+//!
+//! While searching for paths in a stack graph, the algorithm maintains two stacks:
+//!
+//! - **Symbol Stack**: Tracks what symbols we're currently trying to resolve
+//! - **Scope Stack**: Controls which scopes we should search for those symbols in
+//!
+//! These stacks enable:
+//! 1. Handling member access (e.g., `object.field` in many languages)
+//! 2. Modeling lexical scoping rules
+//! 3. Supporting incremental analysis
+//!
+//! ## Quick Example
+//!
+//! ```no_run
+//! use stack_graphs::graph::{StackGraph, NodeID};
+//! use stack_graphs::partial::PartialPaths;
+//! use stack_graphs::stitching::{Database, ForwardPartialPathStitcher};
+//! use stack_graphs::NoCancellation;
+//!
+//! // Create a stack graph
+//! let mut graph = StackGraph::new();
+//! let file = graph.get_or_create_file("example.py");
+//!
+//! // Add nodes for a simple "x = 10" definition
+//! let x_symbol = graph.add_symbol("x");
+//! let scope = graph.add_scope_node(NodeID::new_in_file(file, 0), false).unwrap();
+//! let definition = graph.add_pop_symbol_node(
+//!     NodeID::new_in_file(file, 1),
+//!     x_symbol,
+//!     true  // is_definition
+//! ).unwrap();
+//!
+//! // Connect them
+//! graph.add_edge(scope, definition, 0);
+//!
+//! // Build partial paths for this file
+//! let mut partials = PartialPaths::new();
+//! partials.find_all_partial_paths_in_file(
+//!     &graph,
+//!     file,
+//!     &NoCancellation,
+//!     |_graph, _partials, _path| {}
+//! ).expect("Failed to find partial paths");
+//! ```
 //!
 //! ## Relationship to scope graphs
 //!
