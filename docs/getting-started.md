@@ -214,7 +214,7 @@ use stack_graphs::partial::PartialPaths;
 use stack_graphs::stitching::{Database, ForwardPartialPathStitcher};
 use stack_graphs::NoCancellation;
 
-fn find_definitions(graph: &StackGraph, reference_node: Node) {
+fn find_definitions(graph: &StackGraph, reference_node: Handle<Node>) {
     // Create a database for caching partial paths
     let mut db = Database::new();
 
