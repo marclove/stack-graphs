@@ -195,7 +195,7 @@ fn main() {
         .expect("Failed to create definition");
 
     // Create a reference
-    let ref_node = graph.add_push_symbol_node(NodeID::new_in_file(file, 2), greeting, false)
+    let ref_node = graph.add_push_symbol_node(NodeID::new_in_file(file, 2), greeting, true)
         .expect("Failed to create reference");
 
     // Connect them with edges
