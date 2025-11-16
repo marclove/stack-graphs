@@ -172,7 +172,7 @@ If you want to build stack graphs programmatically without tree-sitter, use the 
 ### Creating a Simple Stack Graph
 
 ```rust
-use stack_graphs::graph::{StackGraph, Node};
+use stack_graphs::graph::{StackGraph, Node, NodeID};
 use stack_graphs::partial::PartialPaths;
 use stack_graphs::stitching::{Database, ForwardPartialPathStitcher};
 
@@ -191,11 +191,11 @@ fn main() {
     let greeting = graph.add_symbol("greeting");
 
     // Create a definition
-    let def_node = graph.add_pop_symbol_node(file, greeting, false)
+    let def_node = graph.add_pop_symbol_node(NodeID::new_in_file(file, 1), greeting, false)
         .expect("Failed to create definition");
 
     // Create a reference
-    let ref_node = graph.add_push_symbol_node(module_scope, greeting, false)
+    let ref_node = graph.add_push_symbol_node(NodeID::new_in_file(file, 2), greeting, true)
         .expect("Failed to create reference");
 
     // Connect them with edges
