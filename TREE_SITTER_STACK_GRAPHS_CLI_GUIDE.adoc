@@ -1,0 +1,1223 @@
+= Tree-Sitter Stack Graphs CLI User Guide
+:toc: left
+:toclevels: 3
+:sectnums:
+:source-highlighter: pygments
+
+== Introduction
+
+The `tree-sitter-stack-graphs` command-line interface (CLI) provides tools for building stack graphs from source code, indexing them for fast lookups, and querying name resolution information. This guide covers all CLI commands and their usage.
+
+=== What This Tool Does
+
+The CLI enables you to:
+
+* Index source files to build stack graphs and partial paths
+* Query for definitions of symbols at specific source positions
+* Test stack graph rules using assertion annotations
+* Visualize stack graphs as interactive HTML
+* Verify database integrity and view indexing status
+* Initialize new language configurations
+
+=== Prerequisites
+
+Before using the CLI, you need:
+
+. A tree-sitter grammar for your target language
+. Stack graph construction rules (TSG files) for that language
+. Source files to analyze
+
+== Installation
+
+=== Building from Source
+
+[source,bash]
+----
+cd tree-sitter-stack-graphs
+cargo build --release
+----
+
+The binary will be at `target/release/tree-sitter-stack-graphs`.
+
+=== Installation
+
+[source,bash]
+----
+cargo install --path tree-sitter-stack-graphs
+----
+
+== Core Concepts
+
+=== The Database
+
+The CLI uses a SQLite database to cache indexed stack graphs and partial paths. This enables:
+
+* Fast incremental updates (only reindex changed files)
+* Persistent storage between runs
+* Efficient querying without rebuilding graphs
+
+The database is stored by default at:
+
+* Linux/macOS: `~/.local/share/tree-sitter-stack-graphs/index.sqlite`
+* Windows: `%APPDATA%\tree-sitter-stack-graphs\index.sqlite`
+
+=== Language Configuration
+
+The CLI discovers language configurations automatically by:
+
+. Looking for a `tree-sitter` configuration file in the current directory
+. Reading `languages` section to find grammar and TSG file locations
+. Loading the grammar and TSG rules for each language
+
+Example `tree-sitter.json`:
+
+[source,json]
+----
+{
+  "languages": [
+    {
+      "name": "python",
+      "grammar": "node_modules/tree-sitter-python",
+      "stack-graphs": "python/stack-graphs.tsg"
+    }
+  ]
+}
+----
+
+=== Source Positions
+
+Many commands accept source position arguments in the format:
+
+----
+FILE:LINE:COLUMN
+----
+
+Where:
+
+* `FILE` is the path to the source file
+* `LINE` is the line number (1-based)
+* `COLUMN` is the column number (1-based, UTF-8 grapheme offset)
+
+Example: `src/main.py:42:15`
+
+== Command Reference
+
+=== index - Build and Store Stack Graphs
+
+Index source files into the database for fast querying.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs index [OPTIONS] <SOURCE_PATH>...
+----
+
+==== Description
+
+The `index` command:
+
+. Parses each source file using the appropriate tree-sitter grammar
+. Runs TSG rules to build stack graphs
+. Computes partial paths for each file
+. Stores results in the SQLite database
+. Only reprocesses files that have changed (content-based hashing)
+
+==== Arguments
+
+`<SOURCE_PATH>...`::
+One or more file or directory paths to index. When a directory is given, all matching source files within are indexed recursively.
+
+==== Options
+
+`--database <PATH>`, `-d <PATH>`::
+Custom database path (overrides default location).
+
+`--source-root <PATH>`::
+Root directory for resolving relative paths. Defaults to current directory.
+
+`--max-file-time <SECONDS>`::
+Maximum time to spend indexing a single file. Files exceeding this are skipped.
++
+Example: `--max-file-time 30`
+
+`--hide-error-details`::
+Suppress detailed error messages for failed files.
+
+`--force`, `-f`::
+Force reindexing even if files haven't changed.
+
+`--no-builtins`::
+Skip loading language built-in definitions.
+
+==== Examples
+
+Index all Python files in current directory:
+
+[source,bash]
+----
+tree-sitter-stack-graphs index .
+----
+
+Index specific files:
+
+[source,bash]
+----
+tree-sitter-stack-graphs index src/main.py src/lib.py
+----
+
+Index with custom database:
+
+[source,bash]
+----
+tree-sitter-stack-graphs index --database /tmp/my-index.db src/
+----
+
+Force reindex (ignore caching):
+
+[source,bash]
+----
+tree-sitter-stack-graphs index --force .
+----
+
+==== Output
+
+The command shows progress for each file:
+
+----
+[✓] src/main.py
+[✓] src/utils.py
+[✗] src/broken.py: parse error at line 15
+----
+
+Symbols:
+
+* `[✓]` - Successfully indexed
+* `[~]` - Already up-to-date (skipped)
+* `[✗]` - Failed to index
+
+=== query - Find Definitions
+
+Query the database to find where symbols are defined.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs query [OPTIONS] definition <SOURCE_POSITION>...
+----
+
+==== Description
+
+The `query definition` command:
+
+. Identifies reference nodes at the given source position(s)
+. Uses path stitching to find definitions those references resolve to
+. Displays the definition locations with source code context
+
+This is the core operation for "go to definition" functionality.
+
+==== Arguments
+
+`<SOURCE_POSITION>...`::
+One or more source positions where references exist.
++
+Format: `FILE:LINE:COLUMN`
+
+==== Options
+
+`--database <PATH>`, `-d <PATH>`::
+Custom database path.
+
+`--stats`::
+Display detailed performance statistics after querying.
+
+`--wait-at-start`::
+Wait for user input before starting (useful for profiling).
+
+==== Examples
+
+Find definition of symbol at line 10, column 5:
+
+[source,bash]
+----
+tree-sitter-stack-graphs query definition src/main.py:10:5
+----
+
+Query multiple positions:
+
+[source,bash]
+----
+tree-sitter-stack-graphs query definition \
+  src/main.py:10:5 \
+  src/main.py:15:12 \
+  src/lib.py:42:8
+----
+
+With statistics:
+
+[source,bash]
+----
+tree-sitter-stack-graphs query --stats definition src/main.py:10:5
+----
+
+==== Output
+
+For each query position, the output shows:
+
+. The reference location and source code
+. The number of definitions found
+. Each definition's location and source code
+
+Example output:
+
+----
+queried reference
+  10 │ result = greet("World")
+     │          ^^^^^
+has definition
+   5 │ def greet(name):
+     │     ^^^^^
+----
+
+If multiple references exist at a position (rare), they are numbered:
+
+----
+found 2 references at position
+    0: queried reference
+       ...
+----
+
+==== No Results
+
+If no definition is found:
+
+----
+queried reference
+  10 │ result = unknown_function()
+     │          ^^^^^^^^^^^^^^^^
+has no definitions
+----
+
+This can happen when:
+
+* The symbol is not defined in indexed files
+* The file is not indexed (run `index` first)
+* The stack graph rules don't correctly model the language semantics
+
+=== status - Check Database Status
+
+View what files are indexed in the database.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs status [OPTIONS]
+----
+
+==== Description
+
+Shows a summary of all files in the database, their indexing status, and version tags.
+
+==== Options
+
+`--database <PATH>`, `-d <PATH>`::
+Custom database path.
+
+`--all`, `-a`::
+Show all files, including successfully indexed ones. By default, only errors are shown.
+
+==== Examples
+
+Show database summary:
+
+[source,bash]
+----
+tree-sitter-stack-graphs status
+----
+
+Show all files:
+
+[source,bash]
+----
+tree-sitter-stack-graphs status --all
+----
+
+==== Output
+
+Example output:
+
+----
+Database: /home/user/.local/share/tree-sitter-stack-graphs/index.sqlite
+
+Summary:
+  Total files:     42
+  Indexed:         40
+  Errors:           2
+
+Files with errors:
+  [!] src/broken.py
+      Error: parse error at line 15:3
+  [!] src/incomplete.py
+      Error: timeout after 30s
+----
+
+With `--all`, successfully indexed files are also listed:
+
+----
+Files:
+  [✓] src/main.py (tag: a3f2e9...)
+  [✓] src/lib.py (tag: 7b8c1d...)
+  [!] src/broken.py
+      Error: parse error
+----
+
+=== test - Run Test Files
+
+Execute test files with assertion annotations.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs test [OPTIONS] <TEST_PATH>...
+----
+
+==== Description
+
+The `test` command processes test files containing special comments that assert expected name resolution behavior. This is the primary way to verify stack graph rules work correctly.
+
+Test assertions use comment syntax specific to each language with special markers:
+
+----
+code_to_test
+//     ^ defined: LINE_NUMBER
+----
+
+The `^` points to a reference, and `defined: LINE_NUMBER` asserts which line its definition is on.
+
+==== Test Annotation Syntax
+
+===== Defined Assertions
+
+Assert a reference resolves to a definition on a specific line:
+
+[source,python]
+----
+def greet(name):        # Line 1
+    return f"Hello {name}"
+
+result = greet("World") # Line 4
+#        ^ defined: 1
+----
+
+The assertion checks that the reference to `greet` on line 4 resolves to the definition on line 1.
+
+===== Defines Assertions
+
+Assert a position defines a specific symbol:
+
+[source,python]
+----
+def my_function(param):
+#   ^ defines: my_function
+    pass
+----
+
+===== Refers Assertions
+
+Assert a position references a specific symbol:
+
+[source,python]
+----
+print(my_variable)
+#     ^ refers: my_variable
+----
+
+==== Arguments
+
+`<TEST_PATH>...`::
+Test file or directory paths. Files or directories ending in `.skip` are excluded.
+
+==== Options
+
+`--quiet`, `-q`::
+Hide passing tests in output (show only failures and summary).
+
+`--hide-error-details`::
+Don't show detailed error messages for failed tests.
+
+`--show-skipped`::
+Include skipped files in output.
+
+`--save-graph[=<PATH_SPEC>]`, `-G[=<PATH_SPEC>]`::
+Save stack graph JSON for tests (see Output Mode below).
++
+Default path: `%n.graph.json`
+
+`--save-paths[=<PATH_SPEC>]`, `-P[=<PATH_SPEC>]`::
+Save partial paths JSON for tests.
++
+Default path: `%n.paths.json`
+
+`--save-visualization[=<PATH_SPEC>]`, `-V[=<PATH_SPEC>]`::
+Save HTML visualization for tests.
++
+Default path: `%n.html`
+
+`--output-mode <MODE>`::
+Control when to save output files. Options:
++
+* `always` - Save for all tests
+* `on-failure` (default) - Save only for failing tests
+* `never` - Never save
+
+`--no-builtins`::
+Don't load language built-in definitions.
+
+`--max-test-time <SECONDS>`::
+Maximum time per test before timeout.
+
+==== Path Specifications
+
+Output filenames support placeholders:
+
+[options="header"]
+|===
+| Placeholder | Meaning
+| `%r` | Root path (directory containing the test file)
+| `%d` | Relative directory path
+| `%n` | File name (without extension)
+| `%e` | File extension (with dot)
+| `%%` | Literal `%`
+|===
+
+Example:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test -V=%r/output/%n.html tests/
+----
+
+==== Examples
+
+Run all tests in a directory:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test tests/
+----
+
+Run specific test file:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test tests/imports.py
+----
+
+Quiet mode (show only failures):
+
+[source,bash]
+----
+tree-sitter-stack-graphs test --quiet tests/
+----
+
+Save visualization for failed tests:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test --save-visualization tests/
+----
+
+Save visualization for all tests:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test \
+  --save-visualization \
+  --output-mode always \
+  tests/
+----
+
+Custom output location:
+
+[source,bash]
+----
+tree-sitter-stack-graphs test \
+  -V=output/%n.html \
+  --output-mode always \
+  tests/
+----
+
+==== Output
+
+For each test, the command shows:
+
+----
+[PASS] tests/basic.py
+[FAIL] tests/imports.py
+  Assertion failed at line 10:
+    Reference does not resolve to expected definition
+    Expected: line 5
+    Actual:   line 8
+
+Summary:
+  Passed:  15
+  Failed:   1
+  Skipped:  2
+  Total:   18
+----
+
+=== visualize - Generate HTML Visualization
+
+Create an interactive HTML visualization of a stack graph.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs visualize [OPTIONS] <SOURCE_PATH>
+----
+
+==== Description
+
+Generates a standalone HTML file with an interactive D3.js visualization of the stack graph. Useful for:
+
+* Understanding how TSG rules build graphs
+* Debugging name resolution issues
+* Creating documentation
+
+==== Arguments
+
+`<SOURCE_PATH>`::
+Source file to visualize.
+
+==== Options
+
+`--database <PATH>`, `-d <PATH>`::
+Use precomputed graph from database instead of building fresh.
+
+`--output <PATH>`, `-o <PATH>`::
+Output HTML file path. Defaults to `<source>.html`.
+
+`--no-builtins`::
+Don't include built-in definitions in visualization.
+
+==== Examples
+
+Visualize a file (build fresh graph):
+
+[source,bash]
+----
+tree-sitter-stack-graphs visualize src/main.py
+----
+
+Use database-indexed graph:
+
+[source,bash]
+----
+tree-sitter-stack-graphs visualize --database index.db src/main.py
+----
+
+Custom output path:
+
+[source,bash]
+----
+tree-sitter-stack-graphs visualize \
+  --output docs/graph.html \
+  src/main.py
+----
+
+==== Output
+
+Creates a self-contained HTML file that can be opened in any browser. The visualization shows:
+
+* All nodes (color-coded by type)
+* Directed edges
+* Symbol and scope information
+* Source locations (when available)
+* Interactive zoom, pan, and node inspection
+
+=== clean - Clean Database
+
+Remove files from the database.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs clean [OPTIONS] [SOURCE_PATH]...
+----
+
+==== Description
+
+Removes indexed data from the database. Useful for:
+
+* Freeing disk space
+* Forcing a complete reindex
+* Removing data for deleted source files
+
+==== Arguments
+
+`[SOURCE_PATH]...`::
+Specific files or directories to remove. If omitted, cleans the entire database.
+
+==== Options
+
+`--database <PATH>`, `-d <PATH>`::
+Custom database path.
+
+`--all`::
+Remove all data (equivalent to omitting source paths).
+
+==== Examples
+
+Clean entire database:
+
+[source,bash]
+----
+tree-sitter-stack-graphs clean --all
+----
+
+Remove specific file:
+
+[source,bash]
+----
+tree-sitter-stack-graphs clean src/old_file.py
+----
+
+Remove directory:
+
+[source,bash]
+----
+tree-sitter-stack-graphs clean src/deprecated/
+----
+
+==== Output
+
+Shows what was removed:
+
+----
+Removed: src/main.py
+Removed: src/lib.py
+Cleaned 2 files from database
+----
+
+=== parse - Show Parse Trees
+
+Display tree-sitter parse trees for source files.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs parse <SOURCE_PATH>...
+----
+
+==== Description
+
+Parses source files and displays their tree-sitter syntax trees. Useful for:
+
+* Understanding what tree-sitter sees
+* Debugging grammar issues
+* Learning tree-sitter node types for writing TSG rules
+
+==== Arguments
+
+`<SOURCE_PATH>...`::
+Source files to parse.
+
+==== Examples
+
+Parse a file:
+
+[source,bash]
+----
+tree-sitter-stack-graphs parse src/main.py
+----
+
+Parse multiple files:
+
+[source,bash]
+----
+tree-sitter-stack-graphs parse src/*.py
+----
+
+==== Output
+
+Displays the S-expression tree:
+
+----
+src/main.py:
+(module
+  (function_definition
+    name: (identifier)
+    parameters: (parameters
+      (identifier))
+    body: (block
+      (return_statement
+        (string)))))
+----
+
+=== match - Test TSG Rules
+
+Test TSG stanzas against source files to see what they match.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs match [OPTIONS] <SOURCE_PATH>...
+----
+
+==== Description
+
+Executes TSG rules against source files and shows what matches. Unlike `test`, this doesn't verify assertions, it just shows which TSG stanzas fire and what nodes/edges they create.
+
+Useful for:
+
+* Debugging TSG rules
+* Understanding rule execution
+* Verifying patterns match correctly
+
+==== Arguments
+
+`<SOURCE_PATH>...`::
+Source files to process.
+
+==== Options
+
+`--no-builtins`::
+Skip built-in definitions.
+
+==== Examples
+
+Test rules against a file:
+
+[source,bash]
+----
+tree-sitter-stack-graphs match src/main.py
+----
+
+==== Output
+
+Shows which stanzas matched and what they produced:
+
+----
+src/main.py:
+  Stanza at rules.tsg:15 matched 3 times
+  Stanza at rules.tsg:42 matched 1 time
+  Created 12 nodes, 15 edges
+----
+
+=== init - Initialize Language Configuration
+
+Create a starter configuration for a new language.
+
+==== Synopsis
+
+[source,bash]
+----
+tree-sitter-stack-graphs init [OPTIONS] <LANGUAGE>
+----
+
+==== Description
+
+Generates boilerplate files for implementing stack graphs for a new language:
+
+* TSG rule file template
+* Test file template
+* License file
+* Basic documentation
+
+==== Arguments
+
+`<LANGUAGE>`::
+Language name (e.g., `python`, `rust`, `javascript`).
+
+==== Options
+
+`--output-dir <PATH>`, `-o <PATH>`::
+Directory to create files in. Defaults to current directory.
+
+==== Examples
+
+Initialize Python configuration:
+
+[source,bash]
+----
+tree-sitter-stack-graphs init python
+----
+
+Custom output directory:
+
+[source,bash]
+----
+tree-sitter-stack-graphs init --output-dir languages/python python
+----
+
+==== Output
+
+Creates:
+
+----
+python/
+├── src/
+│   └── stack-graphs.tsg    # TSG rules template
+├── test/
+│   └── example.py          # Example test file
+├── LICENSE                 # Apache 2.0 / MIT dual license
+└── README.md               # Getting started guide
+----
+
+== Common Workflows
+
+=== Basic: Query Definitions
+
+To find where a symbol is defined:
+
+[source,bash]
+----
+# 1. Index your codebase
+tree-sitter-stack-graphs index src/
+
+# 2. Query for definition at a specific position
+tree-sitter-stack-graphs query definition src/main.py:42:15
+----
+
+=== Development: Testing Stack Graph Rules
+
+When developing TSG rules for a language:
+
+[source,bash]
+----
+# 1. Create test files with assertions
+cat > test/example.py <<EOF
+def greet(name):        # Line 1
+    return name
+
+result = greet("Test")  # Line 4
+#        ^ defined: 1
+EOF
+
+# 2. Run tests
+tree-sitter-stack-graphs test test/
+
+# 3. If tests fail, visualize to debug
+tree-sitter-stack-graphs test \
+  --save-visualization \
+  --output-mode always \
+  test/
+
+# 4. Open generated HTML in browser
+firefox test/example.html
+----
+
+=== Debugging: Understanding What TSG Rules Do
+
+[source,bash]
+----
+# See what the parser produces
+tree-sitter-stack-graphs parse src/example.py
+
+# See what TSG rules match
+tree-sitter-stack-graphs match src/example.py
+
+# Visualize the resulting graph
+tree-sitter-stack-graphs visualize src/example.py
+----
+
+=== Production: Incremental Indexing
+
+For continuous integration or background indexing:
+
+[source,bash]
+----
+# Initial index
+tree-sitter-stack-graphs index --database /var/lib/index.db src/
+
+# Later, only changed files are reindexed
+tree-sitter-stack-graphs index --database /var/lib/index.db src/
+
+# Query is fast (uses cached data)
+tree-sitter-stack-graphs query \
+  --database /var/lib/index.db \
+  definition src/main.py:42:15
+----
+
+=== Maintenance: Database Management
+
+[source,bash]
+----
+# Check what's indexed
+tree-sitter-stack-graphs status
+
+# See everything including successes
+tree-sitter-stack-graphs status --all
+
+# Clean specific outdated files
+tree-sitter-stack-graphs clean src/deleted_file.py
+
+# Complete database reset
+tree-sitter-stack-graphs clean --all
+----
+
+== Troubleshooting
+
+=== "File not indexed" Error
+
+When running `query` and getting "file not indexed":
+
+. Run `status` to verify database contents
+. Run `index <file>` to index the file
+. Check that the file path matches exactly (absolute vs relative)
+
+Example:
+
+[source,bash]
+----
+tree-sitter-stack-graphs status
+# Shows: no files indexed
+
+tree-sitter-stack-graphs index src/
+# Index the directory
+
+tree-sitter-stack-graphs query definition src/main.py:10:5
+# Now works
+----
+
+=== No Definitions Found
+
+When query succeeds but finds no definitions:
+
+. Verify the position points to a reference (not whitespace, comments, etc.)
+. Check that the definition file is indexed
+. Visualize the graph to see if reference and definition nodes exist
+. Test with assertion annotations to get detailed failure info
+
+Example:
+
+[source,bash]
+----
+# Add assertion to test file
+cat > test/debug.py <<EOF
+def greet(name):
+    return name
+
+result = greet("Test")
+#        ^ defined: 1
+EOF
+
+# Run test to see detailed failure
+tree-sitter-stack-graphs test test/debug.py
+----
+
+=== Parse Errors
+
+When files fail to index due to parse errors:
+
+. Verify the source file is syntactically valid
+. Check you have the correct grammar version
+. Ensure tree-sitter configuration points to the right grammar
+
+Example checking the parse tree directly:
+
+[source,bash]
+----
+tree-sitter-stack-graphs parse src/broken_file.py
+# Shows ERROR nodes in the tree
+----
+
+=== Timeout Errors
+
+When indexing times out:
+
+. Increase timeout with `--max-file-time`
+. Check for infinite loops in TSG rules
+. Simplify complex files for testing
+
+Example:
+
+[source,bash]
+----
+tree-sitter-stack-graphs index --max-file-time 60 src/large_file.py
+----
+
+=== Database Path Issues
+
+If the database isn't being found:
+
+. Use `--database` to explicitly specify the path
+. Check file permissions on the database directory
+. Verify the default location exists
+
+Example:
+
+[source,bash]
+----
+# Find default location
+tree-sitter-stack-graphs status
+# Shows: Database: /home/user/.local/share/tree-sitter-stack-graphs/index.sqlite
+
+# Create directory if needed
+mkdir -p ~/.local/share/tree-sitter-stack-graphs/
+----
+
+== Advanced Topics
+
+=== Custom Database Location
+
+For project-specific databases:
+
+[source,bash]
+----
+# Use local database in project
+export TSG_DB="$(pwd)/.stack-graphs.db"
+tree-sitter-stack-graphs index --database "$TSG_DB" src/
+tree-sitter-stack-graphs query --database "$TSG_DB" definition src/main.py:10:5
+----
+
+=== Batch Queries
+
+To query multiple positions efficiently:
+
+[source,bash]
+----
+tree-sitter-stack-graphs query definition \
+  src/main.py:10:5 \
+  src/main.py:15:8 \
+  src/lib.py:42:12 \
+  src/lib.py:100:3
+----
+
+All queries share the same database connection and loaded graph data, making this faster than separate invocations.
+
+=== Performance Tuning
+
+For large codebases:
+
+. Use `--max-file-time` to skip slow files
+. Index incrementally (only changed files)
+. Use `--stats` to identify bottlenecks
+. Consider excluding generated/vendor code
+
+Example:
+
+[source,bash]
+----
+tree-sitter-stack-graphs index \
+  --max-file-time 30 \
+  --stats \
+  src/
+----
+
+=== CI Integration
+
+Example GitHub Actions workflow:
+
+[source,yaml]
+----
+name: Stack Graphs Tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Install tree-sitter-stack-graphs
+        run: cargo install tree-sitter-stack-graphs
+      - name: Run tests
+        run: tree-sitter-stack-graphs test tests/
+----
+
+== Exit Codes
+
+The CLI uses standard exit codes:
+
+[options="header"]
+|===
+| Code | Meaning
+| 0    | Success
+| 1    | Error (failed tests, invalid arguments, etc.)
+| 2    | Usage error (invalid command line)
+|===
+
+In scripts:
+
+[source,bash]
+----
+if tree-sitter-stack-graphs test tests/; then
+    echo "All tests passed"
+else
+    echo "Tests failed"
+    exit 1
+fi
+----
+
+== Environment Variables
+
+`RUST_LOG`::
+Control logging verbosity. Values: `error`, `warn`, `info`, `debug`, `trace`.
++
+[source,bash]
+----
+RUST_LOG=debug tree-sitter-stack-graphs index src/
+----
+
+== Getting Help
+
+=== Command Help
+
+All commands support `--help`:
+
+[source,bash]
+----
+tree-sitter-stack-graphs --help          # Main help
+tree-sitter-stack-graphs index --help    # Index command help
+tree-sitter-stack-graphs query --help    # Query command help
+----
+
+=== Version Information
+
+[source,bash]
+----
+tree-sitter-stack-graphs --version
+----
+
+=== Reporting Issues
+
+When reporting bugs, include:
+
+. Full command line used
+. Error output
+. Contents of test file (if applicable)
+. Database status output
+. Version information
+
+Example bug report:
+
+----
+Command:
+  tree-sitter-stack-graphs query definition src/main.py:10:5
+
+Error:
+  Error: file not indexed
+
+Status:
+  $ tree-sitter-stack-graphs status
+  Total files: 0
+
+Version:
+  $ tree-sitter-stack-graphs --version
+  tree-sitter-stack-graphs 0.1.0
+----
+
+== See Also
+
+* Stack Graphs documentation: https://github.com/github/stack-graphs
+* Tree-sitter documentation: https://tree-sitter.github.io/
+* TSG language reference: See `docs/tsg-language-reference.md` in repository
