@@ -78,35 +78,14 @@ struct LookupDefinitionsParams {
     line_end: usize,
 }
 
-/// A single definition result
-#[derive(Debug, Serialize)]
-struct DefinitionResult {
-    /// Symbol name
-    symbol: String,
-    /// File where the definition is located
-    file: String,
-    /// Line number where definition starts (1-indexed)
-    line: usize,
-    /// Column number where definition starts (1-indexed)
-    column: usize,
-    /// Source code of the definition
-    source: String,
-}
-
 /// Response from lookup_definitions
 #[derive(Debug, Serialize)]
 struct LookupDefinitionsResult {
-    /// All definitions found
-    definitions: Vec<DefinitionResult>,
-    /// Summary statistics
-    summary: LookupSummary,
-}
-
-#[derive(Debug, Serialize)]
-struct LookupSummary {
+    /// Concatenated source code of all definitions
+    definitions: String,
     /// Number of references found in the range
     references_found: usize,
-    /// Number of definitions found
+    /// Number of unique definitions found
     definitions_found: usize,
     /// Number of references with no definition
     unresolved_references: usize,
@@ -271,7 +250,7 @@ impl McpServer {
         eprintln!("Found {} references in range", references.len());
 
         // Find definitions for each reference
-        let mut definitions = Vec::new();
+        let mut definition_sources = Vec::new();
         let mut unresolved_count = 0;
         let mut seen_definitions = HashSet::new();
 
@@ -309,7 +288,7 @@ impl McpServer {
                         if seen_definitions.contains(&def_key) {
                             return;
                         }
-                        seen_definitions.insert(def_key);
+                        seen_definitions.insert(def_key.clone());
 
                         // Get the symbol name
                         let symbol_name = g[definition_node]
@@ -325,14 +304,22 @@ impl McpServer {
                             format!("// Error reading source: {}", e)
                         });
 
-                        definitions.push(DefinitionResult {
-                            symbol: symbol_name,
-                            file: def_file_path.to_string(),
-                            line: source_info.span.start.line + 1, // Convert to 1-indexed
-                            column: source_info.span.start.column.grapheme_offset + 1,
-                            source: def_source,
-                        });
+                        // Format the definition with metadata
+                        let location = format!(
+                            "{}:{}:{}",
+                            def_file_path,
+                            source_info.span.start.line + 1,
+                            source_info.span.start.column.grapheme_offset + 1
+                        );
 
+                        let formatted_definition = format!(
+                            "// Symbol: {}\n// Location: {}\n{}",
+                            symbol_name,
+                            location,
+                            def_source
+                        );
+
+                        definition_sources.push(formatted_definition);
                         found_definition = true;
                     }
                 },
@@ -347,13 +334,18 @@ impl McpServer {
             }
         }
 
+        // Concatenate all definitions with separators
+        let concatenated = if definition_sources.is_empty() {
+            String::new()
+        } else {
+            definition_sources.join("\n\n// ====================================\n\n")
+        };
+
         Ok(LookupDefinitionsResult {
-            definitions,
-            summary: LookupSummary {
-                references_found: references.len(),
-                definitions_found: seen_definitions.len(),
-                unresolved_references: unresolved_count,
-            },
+            definitions: concatenated,
+            references_found: references.len(),
+            definitions_found: seen_definitions.len(),
+            unresolved_references: unresolved_count,
         })
     }
 
